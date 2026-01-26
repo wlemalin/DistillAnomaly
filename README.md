@@ -11,7 +11,7 @@ This repository contains a reproducible, Slurm-based pipeline for **time series 
 ## 1. Pipeline overview
 
 The pipeline is organized into the following stages:
-(Each step's parameters can be specified in the scripts that are called by the main pipeline.sh)
+(Each step's parameters can be specified in the scripts that are called by the main `pipeline.sh`)
 
 - **Synthetic data generation** (`src/data/generate.slurm`)  
   Writes datasets under `all_data/synthetic/` (e.g., `freq/`, `noisy-freq/`) with:
@@ -52,11 +52,11 @@ Reference runs were executed on:
 ## 3. Key directories
 
 - `pipeline.sh` — orchestrates Slurm jobs + aggregation
-- `src/data/` — synthetic generation (Slurm)
+- `src/data/` — synthetic generation
 - `src/annotations/` — annotation processing
 - `all_data/synthetic/` — generated synthetic datasets
 - `all_data/UCR_dataset/` — UCR datasets
-- `train_VL/` — training scripts + Slurm jobs
+- `train_VL/` — training scripts
 - `eval/` — evaluation scripts, JSONL outputs, baselines, results
   - `eval/json_insample/`
   - `eval/json_outsample/`
