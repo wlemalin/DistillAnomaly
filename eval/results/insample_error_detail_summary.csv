@@ -1,0 +1,9 @@
+Pattern Type,baseline-4o-insample_ts1.jsonl,baseline-gpt5.2-insample_ts1.jsonl,eval-qwen-ts1-insample.jsonl,eval-qwen-ts2-insample.jsonl,eval-qwen-ts3-insample.jsonl
+freq,92.9,91.7,100.0,100.0,87.5
+noisy-freq,78.6,100.0,62.5,66.7,100.0
+noisy-point,92.3,100.0,100.0,85.7,62.5
+noisy-trend,86.7,100.0,57.1,83.3,75.0
+point,66.7,93.3,75.0,100.0,80.0
+range,80.0,93.3,75.0,55.6,90.0
+trend,93.3,100.0,88.9,83.3,87.5
+OVERALL,85.6,96.7,76.0,81.6,83.0
