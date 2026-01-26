@@ -1,5 +1,4 @@
-````markdown
-# [PROJECT TITLE — Placeholder]
+# [DistillAnomaly]
 
 This repository contains a reproducible, Slurm-based pipeline for **time series anomaly detection** experiments: **synthetic data generation**, **UCR data preparation**, **VL model training**, **in-sample and out-of-sample evaluation**, and **aggregation** into CSV summaries.
 
@@ -36,8 +35,8 @@ The pipeline is organized into the following stages:
   - `eval/json_insample/` (in-sample / synthetic)
 
 - **Aggregation** (`eval/results/`)  
-  - `aggregate_affil.py`: affiliation summaries (use `--synth` for in-sample)
-  - `citation_summary.py`: explanation/citation-quality + metrics summaries (`--answer-key output`)
+  - `aggregate_affil.py`: affiliation summaries
+  - `citation_summary.py`: explanation/citation-quality + metrics summaries
 
 ---
 
@@ -78,7 +77,6 @@ If you run annotation processing that requires OpenAI access, set:
 export OPENAI_API_KEY="YOUR_KEY_HERE"
 ````
 
----
 
 ## 5. Run
 
