@@ -110,8 +110,8 @@ python aggregate_affil.py  \
  ## Explanation quality:
  ## --- In-Sample Analysis ---
 python citation_summary.py \
-    --out-citations "$RESULTS_DIR/insample_expl_summary.csv" \
-    --out-explanations "$RESULTS_DIR/insample_error_detail_summary.csv" \
+    --out-citations "$RESULTS_DIR/insample_correct_citations.csv" \
+    --out-explanations "$RESULTS_DIR/insample_correct_explanations.csv" \
     --answer-key output \
     --synth \
     "$EVAL_DIR/baselines/baseline-4o-insample_ts1.jsonl" \
@@ -121,7 +121,7 @@ python citation_summary.py \
 
  ## --- Out-of-Sample Analysis ---
 python citation_summary.py \
-    --out-metrics "$RESULTS_DIR/outsample_metrics_summary.csv" \
+    --out-metrics "$RESULTS_DIR/outsample_explanations_summary.csv" \
     --answer-key output \
     "$EVAL_DIR/baselines/baseline-4o-outsample_ts1.jsonl" \
     "$EVAL_DIR/baselines/baseline-gpt5.2-outsample_ts1.jsonl" \
