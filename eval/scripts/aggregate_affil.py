@@ -401,7 +401,7 @@ def main():
             recall = f"{result['recall']:.4f}" if result['recall'] is not None else "NA"
             f1 = f"{result['f1']:.4f}" if result['f1'] is not None else "NA"
 
-            print(f"{file_name:<30} {result['total_series']:<8} {result.get('evaluable_series', 0):<6} "
+            print(f"{file_name:<30} {result.get('evaluable_series', 0):<6} "
                   f"{precision:<10} {recall:<8} {f1:<8}")
 
     # Save results if requested
@@ -432,7 +432,7 @@ def main():
                 df = pd.DataFrame([
                     {
                         "file": r["file"],
-                        "total_series": r["total_series"],
+                        # "total_series": r["total_series"],
                         "evaluable_series": r.get("evaluable_series", 0),
                         "precision": r["precision"],
                         "recall": r["recall"],
