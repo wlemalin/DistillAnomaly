@@ -51,12 +51,15 @@ echo "Using Python: $(python --version)"
 # python "$ANNOT_DIR/gpt_annotate.py" --image-mode ts3 --base-name annotations --filter
 
 # # Baselines
+#
 # python "$ANNOT_DIR/gpt_baseline.py" --base-name "$EVAL_DIR/baselines/baseline-4o-insample"
 # python "$ANNOT_DIR/gpt_baseline.py" --base-name "$EVAL_DIR/baselines/baseline-gpt5.2-insample"
 # python "$ANNOT_DIR/gpt_baseline_outsample.py" --base-name "$EVAL_DIR/baselines/baseline-4o-outsample"
 # python "$ANNOT_DIR/gpt_baseline_outsample.py" --base-name "$EVAL_DIR/baselines/baseline-gpt5.2-outsample"
 
-# 
+# python "$ANNOT_DIR/park_baseline.py" --base-name "$EVAL_DIR/baselines/baseline-park-insample.jsonl"
+# python "$ANNOT_DIR/park_baseline_outsample.py" --base-name "$EVAL_DIR/baselines/baseline-park-outsample.jsonl"
+
 # # ==============================================================================
 # # 3. TRAIN QWEN-VL
 # # ==============================================================================
