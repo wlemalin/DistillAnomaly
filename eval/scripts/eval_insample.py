@@ -4,7 +4,7 @@ Standalone 'APRES' evaluation script for a Qwen2.5-VL LoRA checkpoint.
 
 Usage:
 python vl_lora_eval_apres.py \
-  --base_model_dir ../hf_models/Qwen2.5-VL-3B-Instruct_clean \
+  --base_model_dir ../hf_models/Qwen2.5-VL-3B-Instruct \
   --adapter_dir ./qwen2.5-vl-3b-ft-lora-eval \
   --data_json /path/to/all_samples.jsonl \
   --val_ratio 0.10 \

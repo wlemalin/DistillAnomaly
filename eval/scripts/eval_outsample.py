@@ -39,7 +39,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--vl-model-path", type=Path, 
-    default=Path(os.path.expandvars("$HOME/hf_models/Qwen2.5-VL-3B-Instruct_clean")),
+    default=Path(os.path.expandvars("$HOME/hf_models/Qwen2.5-VL-3B-Instruct")),
     help="Path to the base VL model."
 )
 # --------------------------

@@ -7,7 +7,7 @@ export PROJ_ROOT=$(pwd)
 
 # Model Paths (Adjust these if yours are elsewhere)
 export HF_MODELS="$HOME/hf_models"
-export BASE_MODEL="$HF_MODELS/Qwen2.5-VL-3B-Instruct_clean"
+export BASE_MODEL="$HF_MODELS/Qwen2.5-VL-3B-Instruct"
 export ST_MODEL="$HF_MODELS/all_MiniLM-L6-v2"
 
 
@@ -26,6 +26,8 @@ mkdir -p "$EVAL_DIR/json_outsample"
 echo "Pipeline starting from: $PROJ_ROOT"
 echo "Using Python: $(python --version)"
 
+# Every step's results are saved in the repo so evaluation can be run without having to run training again
+
 # # ==============================================================================
 # # 1. GENERATE DATA
 # # ==============================================================================
@@ -38,17 +40,17 @@ echo "Using Python: $(python --version)"
 #
 #
 
-# ==============================================================================
-# 2. GENERATE ANNOTATIONS & BASELINES
-# ==============================================================================
+# # ==============================================================================
+# # 2. GENERATE ANNOTATIONS & BASELINES
+# # ==============================================================================
 #cd "$PROJ_ROOT"
 
-# Annotations
+# # Annotations
 # python "$ANNOT_DIR/gpt_annotate.py" --image-mode ts1 --base-name annotations --filter
 # python "$ANNOT_DIR/gpt_annotate.py" --image-mode ts2 --base-name annotations --filter
 # python "$ANNOT_DIR/gpt_annotate.py" --image-mode ts3 --base-name annotations --filter
 
-# Baselines
+# # Baselines
 # python "$ANNOT_DIR/gpt_baseline.py" --base-name "$EVAL_DIR/baselines/baseline-4o-insample"
 # python "$ANNOT_DIR/gpt_baseline.py" --base-name "$EVAL_DIR/baselines/baseline-gpt5.2-insample"
 # python "$ANNOT_DIR/gpt_baseline_outsample.py" --base-name "$EVAL_DIR/baselines/baseline-4o-outsample"
@@ -63,22 +65,22 @@ echo "Using Python: $(python --version)"
 # # JOB3=$(sbatch --parsable --dependency=afterok:$JOB2 train_clip.slurm)
 # JOB3=$(sbatch --parsable train_clip.slurm)
 
-# ==============================================================================
-# 4. EVALUATION
-# ==============================================================================
-cd "$EVAL_DIR/scripts/"
-# These two can run in parallel, but both depend on Training (JOB3)
+# # ==============================================================================
+# # 4. EVALUATION
+# # ==============================================================================
+# cd "$EVAL_DIR/scripts/"
+# # These two can run in parallel, but both depend on Training (JOB3)
 # JOB4=$(sbatch --parsable --dependency=afterok:$JOB3 eval_outsample.slurm)
 # JOB5=$(sbatch --parsable --dependency=afterok:$JOB3 eval_insample.slurm)
 #
+# # # ==============================================================================
+# # 5. AGGREGATION & SUMMARIZATION
 # # ==============================================================================
-# 5. AGGREGATION & SUMMARIZATION
-# ==============================================================================
-
+#
 # echo "Waiting for evaluation jobs ($JOB4, $JOB5) to complete before aggregating..."
 #
-# # wait_for_jobs() {
-# #     while squeue -j $(echo "$@" | tr ' ' ',') -h | grep -q ^; do
+# wait_for_jobs() {
+#     while squeue -j $(echo "$@" | tr ' ' ',') -h | grep -q ^; do
 #         sleep 30
 #     done
 # }
@@ -86,6 +88,7 @@ cd "$EVAL_DIR/scripts/"
 # srun --dependency=afterok:$JOB4:$JOB5 --jobid=$JOB4 sleep 0 2>/dev/null || wait_for_jobs $JOB4 $JOB5
 #
 # # Affiliation metrics:
+cd "$EVAL_DIR/scripts/"
 python aggregate_affil.py  \
     --out "$RESULTS_DIR/outsample_affil_summary.csv" \
     "$EVAL_DIR/baselines/baseline-park-outsample.jsonl" \

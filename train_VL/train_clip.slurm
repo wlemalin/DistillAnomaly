@@ -18,7 +18,7 @@ echo "Running on $(hostname), Python: $(python --version)"
 PROJ_DIR=$(pwd)
 
 # Define the model paths here
-MODEL_PATH="$HOME/hf_models/Qwen2.5-VL-3B-Instruct_clean"
+MODEL_PATH="$HOME/hf_models/Qwen2.5-VL-3B-Instruct"
 
 run_one(){
 local data=$1

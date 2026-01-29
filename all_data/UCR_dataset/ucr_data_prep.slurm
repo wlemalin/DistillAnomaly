@@ -5,7 +5,7 @@
 #SBATCH --error=qwen_%j.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --time=05:00:00
+#SBATCH --time=01:00:00
 
 # 1) Load your modules (must come before sourcing your venv) 
 module purge                            

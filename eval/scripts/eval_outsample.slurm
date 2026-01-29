@@ -18,7 +18,7 @@ echo "Running on $(hostname), Python: $(python --version)"
 
 srun --exclusive -N1 -n1 python eval_outsample.py \
   --mode ts \
-  --vl-model-path "$HOME/hf_models/Qwen2.5-VL-3B-Instruct_clean" \
+  --vl-model-path "$HOME/hf_models/Qwen2.5-VL-3B-Instruct" \
   --csv-dir "../../all_data/UCR_dataset/csv_data/" \
   --img-dir "../../all_data/UCR_dataset/figs_data/"  \
   --lora-adapter-path "../../train_VL/qwen2.5-vl-3b-lora-vl-ts1-10ep/checkpoint-580" \
@@ -27,7 +27,7 @@ srun --exclusive -N1 -n1 python eval_outsample.py \
 
 srun --exclusive -N1 -n1 python eval_outsample.py \
   --mode ts2 \
-  --vl-model-path "$HOME/hf_models/Qwen2.5-VL-3B-Instruct_clean" \
+  --vl-model-path "$HOME/hf_models/Qwen2.5-VL-3B-Instruct" \
   --csv-dir "../../all_data/UCR_dataset/csv_data/" \
   --img-dir "../../all_data/UCR_dataset/figs_data/"  \
   --lora-adapter-path "../../train_VL/qwen2.5-vl-3b-lora-vl-ts2-15ep/checkpoint-825" \
@@ -36,7 +36,7 @@ srun --exclusive -N1 -n1 python eval_outsample.py \
 
 srun --exclusive -N1 -n1 python eval_outsample.py \
   --mode ts3 \
-  --vl-model-path "$HOME/hf_models/Qwen2.5-VL-3B-Instruct_clean" \
+  --vl-model-path "$HOME/hf_models/Qwen2.5-VL-3B-Instruct" \
   --csv-dir "../../all_data/UCR_dataset/csv_data/" \
   --img-dir "../../all_data/UCR_dataset/figs_data/"  \
   --lora-adapter-path "../../train_VL/qwen2.5-vl-3b-lora-vl-ts3-20ep/checkpoint-1060" \
