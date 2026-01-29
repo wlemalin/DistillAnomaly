@@ -190,14 +190,14 @@ def merge_lora_inplace(model, adapter_dir: Path):
         with torch.no_grad():
             linear.weight += delta.to(dtype=linear.weight.dtype)
         merged += 1
-    print(f"✅ LoRA merge complete: merged {merged} layers, skipped {skipped}.")
+    print(f"LoRA merge complete: merged {merged} layers, skipped {skipped}.")
 
 if not args.disable_lora:
     try:
         adapter_dir = text_lora_adapter_path if IS_TEXT_ONLY else vl_lora_adapter_path
         merge_lora_inplace(model, adapter_dir)
     except Exception as e:
-        print(f"⚠️ LoRA merge failed ({e}). Proceeding with base model only.")
+        print(f"LoRA merge failed ({e}). Proceeding with base model only.")
 
 # ========= PROMPT =========
 IMAGE_MODE_DESCRIPTIONS: Dict[str, str] = {
@@ -433,7 +433,7 @@ for fname in tqdm(sorted(os.listdir(csv_dir))):
     if not IS_TEXT_ONLY:
         missing = [p for p in image_paths if not p.exists()]
         if missing:
-            print(f"⚠️ Missing images for {fname}: {', '.join(str(p) for p in missing)}")
+            print(f"Missing images for {fname}: {', '.join(str(p) for p in missing)}")
             continue
 
     # ---- Prepare images (VL only) ----
@@ -489,7 +489,7 @@ for fname in tqdm(sorted(os.listdir(csv_dir))):
     try:
         series_txt, header_txt = format_series_for_mode(df, IMG_MODE)
     except Exception as e:
-        print(f"⚠️ Skipping {fname}: {e}")
+        print(f"Skipping {fname}: {e}")
         continue
 
     images_note = IMAGE_MODE_DESCRIPTIONS.get(IMG_MODE, "")
@@ -565,7 +565,7 @@ for fname in tqdm(sorted(os.listdir(csv_dir))):
         try:
             out_json = json.loads(llm_json)
         except json.JSONDecodeError:
-            print(f"⚠️ JSON parse failed for {fname}")
+            print(f"JSON parse failed for {fname}")
 
     results.append({
         "id": series_id,
@@ -581,5 +581,5 @@ with open(output_jsonl, "w") as f:
     for row in results:
         json.dump(row, f); f.write("\n")
 
-print(f"✅ Done. Saved: {output_jsonl}")
+print(f"Done. Saved: {output_jsonl}")
 
