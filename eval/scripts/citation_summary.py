@@ -1,817 +1,835 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-Citation Verification Metrics Summary
+Aggregate citation verification metrics over several experiment directories.
 
-Processes multiple JSONL files containing citation verification results
-and produces a consolidated summary table using the exact same computation
-logic as the original verification script.
+Expected file naming convention:
 
-Usage:
-    python citation_verification_summary.py results/*.jsonl
-    python citation_verification_summary.py --prompt-key context --answer-key output --plain-text results/*.jsonl
-    python citation_verification_summary.py --synth --out-citations citations.csv --out-explanations explanations.csv results/*.jsonl
-    python citation_verification_summary.py --out-metrics metrics.csv results/*.jsonl
+    experiment-name-1.jsonl
+    experiment-name-2.jsonl
+    experiment-name-3.jsonl
+
+The final "-N" suffix is treated as the run id.
+All runs belonging to the same experiment are averaged together.
+
+This script imports the citation verification backend from citation_verification.py.
 """
 
 import argparse
-import json
-import sys
-from pathlib import Path
-from typing import Dict, Any, List, Optional, Set
-from collections import defaultdict
-import re
 import csv
+import json
+import os
+import re
+import statistics
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-def load_jsonl(path: Path) -> List[Dict[str, Any]]:
-    """Load JSONL file and return list of records."""
-    out = []
+from eval_explanations import parse_context_data, verify_citations
+
+
+RUN_SUFFIX_RE = re.compile(r"^(?P<experiment>.+)-(?P<run>\d+)$")
+
+
+SUMMARY_METRICS = [
+    "avg_true_per_record",
+    "avg_false_per_record",
+    "correct_citations_percent",
+    "fully_truthful_explanations_percent",
+    "feature_confusion_frequency_percent",
+    "time_confusion_frequency_percent",
+    "other_error_frequency_percent",
+]
+
+COUNT_METRICS = [
+    "processed_records",
+    "total_citations",
+    "true_citations",
+    "false_citations",
+    "perfect_records",
+    "feature_confusion_errors",
+    "time_imprecision_errors",
+    "other_errors",
+]
+
+
+def relpath(path: Path) -> str:
+    try:
+        return os.path.relpath(path, Path.cwd())
+    except ValueError:
+        return str(path)
+
+
+def safe_mean(values: Iterable[Optional[float]]) -> Optional[float]:
+    xs = [float(v) for v in values if v is not None]
+    return sum(xs) / len(xs) if xs else None
+
+
+def safe_std(values: Iterable[Optional[float]]) -> Optional[float]:
+    xs = [float(v) for v in values if v is not None]
+    if not xs:
+        return None
+    if len(xs) == 1:
+        return 0.0
+    return statistics.stdev(xs)
+
+
+def fmt_float(value: Optional[float], decimals: int = 2) -> str:
+    if value is None:
+        return "NA"
+    return f"{value:.{decimals}f}"
+
+
+def fmt_count(value: Optional[float]) -> str:
+    if value is None:
+        return "NA"
+    if abs(value - round(value)) < 1e-9:
+        return str(int(round(value)))
+    return f"{value:.2f}"
+
+
+def init_stats() -> Dict[str, int]:
+    return {
+        "count": 0,
+        "true": 0,
+        "false": 0,
+        "perfect": 0,
+        "feature_confusion_errors": 0,
+        "time_imprecision_errors": 0,
+        "other_errors": 0,
+    }
+
+
+def load_jsonl(path: Path) -> Tuple[List[Dict[str, Any]], int]:
+    records: List[Dict[str, Any]] = []
+    invalid_lines = 0
+
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if line:
-                try:
-                    out.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    return out
 
-def parse_context_data(prompt_text: str, plain_text: bool = False) -> Dict[int, Dict[str, int]]:
-    """
-    Reconstructs time series data from the prompt text - exactly like original script.
-    
-    Default mode:
-      - Lines like: 12 : 23
-      - Or multi-feature lines: 12 : 23, 1, 0, 5
-      - Optional header: "# Columns per line: timestamp : value, moving_average, ..."
-
-    --plain-text mode:
-      - Lines like: timestamp: 12, value: 23, moving_average: 1, moving_std: 0
-      - Supports 1..N features (whatever appears on each line)
-    """
-    if not isinstance(prompt_text, str):
-        return {}
-
-    def _to_int(raw: str) -> Optional[int]:
-        raw = raw.strip()
-        try:
-            if "." in raw:
-                f = float(raw)
-                if f.is_integer():
-                    return int(f)
-                return None
-            return int(raw)
-        except ValueError:
-            return None
-
-    def _norm_key(k: str) -> str:
-        k = k.strip().lower()
-        aliases = {
-            "ts": "timestamp",
-            "time": "timestamp",
-            "val": "value",
-        }
-        return aliases.get(k, k)
-
-    if plain_text:
-        data_map: Dict[int, Dict[str, int]] = {}
-        lines = prompt_text.splitlines()
-
-        pair_re = re.compile(r"([A-Za-z_][A-Za-z0-9_\-]*)\s*:\s*([\-]?\d+(?:\.\d+)?)")
-
-        for line in lines:
-            line = line.strip()
             if not line:
                 continue
 
-            pairs = pair_re.findall(line)
-            if not pairs:
-                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                invalid_lines += 1
 
-            row_feats: Dict[str, int] = {}
-            ts_val: Optional[int] = None
+    return records, invalid_lines
 
-            for k_raw, v_raw in pairs:
-                k = _norm_key(k_raw)
-                v = _to_int(v_raw)
-                if v is None:
-                    continue
 
-                if k == "timestamp":
-                    ts_val = v
-                else:
-                    row_feats[k] = v
-
-            if ts_val is None or not row_feats:
-                continue
-
-            data_map[ts_val] = row_feats
-
-        return data_map
-
-    # ---- Default (current) format parsing ---------------------------------
-    data_map: Dict[int, Dict[str, int]] = {}
-
-    header_pattern = re.search(r"#\s*Columns per line\s*:\s*timestamp\s*:\s*(.+)", prompt_text)
-    if header_pattern:
-        col_str = header_pattern.group(1).strip()
-        feature_names = [x.strip() for x in col_str.split(",") if x.strip()]
-    else:
-        feature_names = ["value", "moving_average", "moving_std", "centroid"]
-
-    lines = prompt_text.splitlines()
-    row_pattern = re.compile(r"^(\d+)\s*:\s*(.+)$")
-
-    for line in lines:
-        line = line.strip()
-        m = row_pattern.match(line)
-        if not m:
-            continue
-
-        ts = int(m.group(1))
-        vals_str = m.group(2).strip()
-
-        parts = [p.strip() for p in vals_str.split(",") if p.strip()]
-        vals: List[int] = []
-        ok = True
-
-        for p in parts:
-            v = _to_int(p)
-            if v is None:
-                ok = False
-                break
-            vals.append(v)
-
-        if not ok or not vals:
-            continue
-
-        row_data: Dict[str, int] = {}
-        limit = min(len(feature_names), len(vals))
-        for i in range(limit):
-            row_data[feature_names[i]] = vals[i]
-
-        data_map[ts] = row_data
-
-    return data_map
-
-def verify_citations(
-    text: str,
-    data_map: Dict[int, Dict[str, int]],
-    context_window: int = 3,
-    max_failed_examples: int = 5
-) -> Dict[str, Any]:
-    """
-    Parses text for citations (feature@timestamp:value) and verifies them
-    against the provided data_map - exactly like original script.
-    """
-    if not isinstance(text, str):
-        return {
-            "has_citations": False,
-            "true_count": 0,
-            "false_count": 0,
-            "score": 0.0,
-            "logs": ["FAIL: Input text is not a string."],
-            "failed_examples": [],
-            "feature_confusion_errors": 0,
-            "feature_confusion_share": 0.0,
-            "time_imprecision_errors": 0,
-            "time_imprecision_share": 0.0,
-            "other_errors": 0,
-            "other_error_share": 0.0,
-        }
-
-    pattern = re.compile(r'([\w\-_]+)@(\d+)\s*:\s*([\-]?\d+)')
-    matches = pattern.findall(text)
-
-    FEATURE_ALIASES = {
-        "index": "value",
-        "values": "value",
-        "average": "moving_average",
+def default_empty_eval_result(reason: str) -> Dict[str, Any]:
+    return {
+        "has_citations": False,
+        "true_count": 0,
+        "false_count": 0,
+        "total_citations": 0,
+        "score": 0.0,
+        "logs": [reason],
+        "failed_examples": [],
+        "feature_confusion_errors": 0,
+        "feature_confusion_frequency": 0.0,
+        "time_imprecision_errors": 0,
+        "time_imprecision_frequency": 0.0,
+        "other_errors": 0,
+        "other_error_frequency": 0.0,
     }
 
-    def normalize_feature_name(raw: str) -> str:
-        k = raw.strip()
-        k_lower = k.lower()
-        return FEATURE_ALIASES.get(k_lower, k)
 
-    logs: List[str] = []
-    true_facts = 0
-    false_facts = 0
-    failed_examples: List[Dict[str, Any]] = []
+def update_stats(stats: Dict[str, int], eval_result: Dict[str, Any]) -> None:
+    true_count = int(eval_result.get("true_count", 0))
+    false_count = int(eval_result.get("false_count", 0))
 
-    feature_confusion_errors = 0
-    time_imprecision_errors = 0
-    other_errors = 0
+    stats["count"] += 1
+    stats["true"] += true_count
+    stats["false"] += false_count
 
-    if not matches:
-        return {
-            "has_citations": False,
-            "true_count": 0,
-            "false_count": 0,
-            "score": 0.0,
-            "logs": ["FAIL: No citations found in format (feature@time:value)."],
-            "failed_examples": [],
-            "feature_confusion_errors": 0,
-            "feature_confusion_share": 0.0,
-            "time_imprecision_errors": 0,
-            "time_imprecision_share": 0.0,
-            "other_errors": 0,
-            "other_error_share": 0.0,
-        }
+    stats["feature_confusion_errors"] += int(eval_result.get("feature_confusion_errors", 0))
+    stats["time_imprecision_errors"] += int(eval_result.get("time_imprecision_errors", 0))
+    stats["other_errors"] += int(eval_result.get("other_errors", 0))
 
-    def add_fail_example(example: Dict[str, Any]):
-        if len(failed_examples) < max_failed_examples:
-            failed_examples.append(example)
+    if false_count == 0:
+        stats["perfect"] += 1
 
-    def _feature_confusion_same_ts(ts_: int, cited_feature_: str, cited_val_: int) -> Optional[str]:
-        row = data_map.get(ts_)
-        if not row:
-            return None
-        for f_name, f_val in row.items():
-            if f_name == cited_feature_:
-                continue
-            if f_val == cited_val_:
-                return f_name
-        return None
 
-    def _time_imprecision_pm2(ts_: int, cited_feature_: str, cited_val_: int) -> Optional[int]:
-        for delta in (-4, -1, 1, 4):
-            t2 = ts_ + delta
-            row = data_map.get(t2)
-            if not row:
-                continue
-            if cited_feature_ in row and row[cited_feature_] == cited_val_:
-                return t2
-        return None
+def summarize_stats(stats: Dict[str, int]) -> Dict[str, Any]:
+    processed_records = stats["count"]
+    true_citations = stats["true"]
+    false_citations = stats["false"]
+    total_citations = true_citations + false_citations
 
-    def _attribute_error_exclusive(ts_: int, cited_feature_: str, cited_val_: int) -> Dict[str, Any]:
-        if ts_ in data_map:
-            matched_feat = _feature_confusion_same_ts(ts_, cited_feature_, cited_val_)
-            if matched_feat is not None:
-                return {
-                    "category": "feature_confusion_same_ts",
-                    "matched_feature": matched_feat,
-                }
-
-        matched_ts = _time_imprecision_pm2(ts_, cited_feature_, cited_val_)
-        if matched_ts is not None:
-            return {
-                "category": "time_imprecision_pm2",
-                "matched_timestamp": matched_ts,
-            }
-
-        return {"category": "other"}
-
-    for feature, ts_str, val_str in matches:
-        ts = int(ts_str)
-        raw_feature = feature
-        feature = normalize_feature_name(feature)
-
-        try:
-            val_cited = int(val_str)
-        except ValueError:
-            false_facts += 1
-            other_errors += 1
-            msg = f"FAIL: Malformed value '{val_str}' for {feature}@{ts}"
-            logs.append(msg)
-            add_fail_example({
-                "feature": feature,
-                "raw_feature": raw_feature,
-                "timestamp": ts,
-                "cited_value_raw": val_str,
-                "reason": "malformed_value",
-                "error_attribution": {"category": "other"},
-            })
-            continue
-
-        # Check Timestamp exists
-        if ts not in data_map:
-            false_facts += 1
-            attribution = _attribute_error_exclusive(ts, feature, val_cited)
-
-            if attribution["category"] == "feature_confusion_same_ts":
-                feature_confusion_errors += 1
-            elif attribution["category"] == "time_imprecision_pm2":
-                time_imprecision_errors += 1
-            else:
-                other_errors += 1
-
-            logs.append(f"FAIL: {feature}@{ts} - Timestamp out of bounds")
-            continue
-
-        # Check Feature Name exists
-        if feature not in data_map[ts]:
-            false_facts += 1
-            attribution = _attribute_error_exclusive(ts, feature, val_cited)
-
-            if attribution["category"] == "feature_confusion_same_ts":
-                feature_confusion_errors += 1
-            elif attribution["category"] == "time_imprecision_pm2":
-                time_imprecision_errors += 1
-            else:
-                other_errors += 1
-
-            available = list(data_map[ts].keys())
-            logs.append(f"FAIL: {feature}@{ts} - Feature not found (Available: {available})")
-            continue
-
-        # Check Value Accuracy
-        actual_val = data_map[ts][feature]
-        if actual_val != val_cited:
-            false_facts += 1
-            attribution = _attribute_error_exclusive(ts, feature, val_cited)
-
-            if attribution["category"] == "feature_confusion_same_ts":
-                feature_confusion_errors += 1
-            elif attribution["category"] == "time_imprecision_pm2":
-                time_imprecision_errors += 1
-            else:
-                other_errors += 1
-
-            logs.append(f"FAIL: {feature}@{ts} - Cited {val_cited} vs Actual {actual_val}")
-        else:
-            true_facts += 1
-            logs.append(f"PASS: {feature}@{ts} - Cited {val_cited} matches Actual {actual_val}")
-
-    total_claims = true_facts + false_facts
-    score = (true_facts / total_claims) if total_claims > 0 else 0.0
-
-    fc_share = (feature_confusion_errors / false_facts) if false_facts > 0 else 0.0
-    ti_share = (time_imprecision_errors / false_facts) if false_facts > 0 else 0.0
-    other_share = (other_errors / false_facts) if false_facts > 0 else 0.0
+    feature_confusion_errors = stats["feature_confusion_errors"]
+    time_imprecision_errors = stats["time_imprecision_errors"]
+    other_errors = stats["other_errors"]
 
     return {
-        "has_citations": True,
-        "true_count": true_facts,
-        "false_count": false_facts,
-        "score": round(score, 2),
-        "logs": logs,
+        "processed_records": processed_records,
+        "total_citations": total_citations,
+        "true_citations": true_citations,
+        "false_citations": false_citations,
+        "perfect_records": stats["perfect"],
+
+        "avg_true_per_record": (
+            true_citations / processed_records if processed_records > 0 else None
+        ),
+        "avg_false_per_record": (
+            false_citations / processed_records if processed_records > 0 else None
+        ),
+        "correct_citations_percent": (
+            100.0 * true_citations / total_citations if total_citations > 0 else None
+        ),
+        "fully_truthful_explanations_percent": (
+            100.0 * stats["perfect"] / processed_records if processed_records > 0 else None
+        ),
+
         "feature_confusion_errors": feature_confusion_errors,
-        "feature_confusion_share": round(fc_share, 3),
         "time_imprecision_errors": time_imprecision_errors,
-        "time_imprecision_share": round(ti_share, 3),
         "other_errors": other_errors,
-        "other_error_share": round(other_share, 3),
+
+        "feature_confusion_frequency_percent": (
+            100.0 * feature_confusion_errors / total_citations
+            if total_citations > 0
+            else None
+        ),
+        "time_confusion_frequency_percent": (
+            100.0 * time_imprecision_errors / total_citations
+            if total_citations > 0
+            else None
+        ),
+        "other_error_frequency_percent": (
+            100.0 * other_errors / total_citations
+            if total_citations > 0
+            else None
+        ),
     }
 
-def process_single_jsonl_file(jsonl_path: Path, prompt_key: str, answer_key: str, plain_text: bool) -> Dict[str, Any]:
-    """Process a single JSONL file and return verification results."""
-    rows = load_jsonl(jsonl_path)
-    
-    results = []
-    for record in rows:
-        # Skip records with missing keys (same logic as original script)
+
+def process_single_jsonl(
+    jsonl_path: Path,
+    prompt_key: str,
+    answer_key: str,
+    plain_text: bool,
+    context_window: int,
+    max_failed_examples: int,
+) -> Dict[str, Any]:
+    records, invalid_json_lines = load_jsonl(jsonl_path)
+
+    overall_stats = init_stats()
+    by_pattern_stats: Dict[str, Dict[str, int]] = defaultdict(init_stats)
+
+    missing_key_records = 0
+    empty_context_records = 0
+
+    for record in records:
         if prompt_key not in record or answer_key not in record:
+            missing_key_records += 1
             continue
-            
+
+        pattern_type = str(record.get("pattern_type", "unknown"))
+
         prompt_text = record[prompt_key]
         eval_text = record[answer_key]
-        p_type = record.get("pattern_type", "unknown")
-        
-        # Parse data context
-        data_map = parse_context_data(prompt_text, plain_text=plain_text)
-        
-        if not data_map:
-            results.append({
-                "pattern_type": p_type,
-                "has_citations": False,
-                "true_count": 0,
-                "false_count": 0,
-                "score": 0.0,
-                "logs": ["FAIL: Could not parse context data"]
-            })
-            continue
-        
-        # Verify citations
-        eval_result = verify_citations(eval_text, data_map)
-        eval_result["pattern_type"] = p_type
-        results.append(eval_result)
-    
-    return {"file": str(jsonl_path.name), "results": results}
 
-def aggregate_stats_by_file(all_results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Aggregate stats separately for each file to create matrix format."""
-    
-    # Stats by file and pattern type
-    file_stats = {}
-    all_pattern_types = set()
-    
-    for file_result in all_results:
-        filename = file_result["file"]
-        file_stats[filename] = defaultdict(lambda: {
-            "count": 0, "true": 0, "false": 0, "perfect": 0,
-            "feature_confusion_errors": 0, "time_imprecision_errors": 0, "other_errors": 0
-        })
-        
-        for result in file_result["results"]:
-            p_type = result.get("pattern_type", "unknown")
-            all_pattern_types.add(p_type)
-            
-            if result.get("has_citations", False):
-                file_stats[filename][p_type]["count"] += 1
-                if "true_count" in result:
-                    file_stats[filename][p_type]["true"] += result["true_count"]
-                    file_stats[filename][p_type]["false"] += result["false_count"]
-                    file_stats[filename][p_type]["feature_confusion_errors"] += result.get("feature_confusion_errors", 0)
-                    file_stats[filename][p_type]["time_imprecision_errors"] += result.get("time_imprecision_errors", 0)
-                    file_stats[filename][p_type]["other_errors"] += result.get("other_errors", 0)
-                    
-                    if result["false_count"] == 0:
-                        file_stats[filename][p_type]["perfect"] += 1
-    
-    # Convert to regular dict and sort
-    sorted_pattern_types = sorted(all_pattern_types)
-    clean_file_stats = {}
-    for filename, stats in file_stats.items():
-        clean_file_stats[filename] = {pt: dict(stats[pt]) for pt in sorted_pattern_types}
-    
-    return {
-        "file_stats": clean_file_stats,
-        "pattern_types": sorted_pattern_types,
-        "total_files": len(all_results)
+        data_map = parse_context_data(prompt_text, plain_text=plain_text)
+
+        if not data_map:
+            empty_context_records += 1
+            eval_result = default_empty_eval_result("FAIL: Could not parse context data")
+        else:
+            eval_result = verify_citations(
+                eval_text,
+                data_map,
+                context_window=context_window,
+                max_failed_examples=max_failed_examples,
+            )
+
+        update_stats(overall_stats, eval_result)
+        update_stats(by_pattern_stats[pattern_type], eval_result)
+
+    by_pattern_type = {
+        pattern_type: summarize_stats(stats)
+        for pattern_type, stats in sorted(by_pattern_stats.items())
     }
 
-def save_citations_matrix_csv(file_stats: Dict[str, Dict[str, Dict[str, int]]], pattern_types: List[str], output_path: str):
-    """Save % Correct Citations matrix as CSV (Pattern Type vs Files)."""
-    with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
-        writer = csv.writer(csvfile)
-        
-        # Header with file names
-        header = ['Pattern Type'] + list(file_stats.keys())
-        writer.writerow(header)
-        
-        # Data rows for each pattern type
-        for p_type in pattern_types:
-            row = [p_type]
-            for filename in file_stats.keys():
-                stats = file_stats[filename].get(p_type, {"count": 0, "true": 0, "false": 0})
-                count = stats["count"]
-                if count > 0:
-                    total_facts = stats["true"] + stats["false"]
-                    accuracy = (stats["true"] / total_facts * 100) if total_facts > 0 else 0.0
-                    row.append(f"{accuracy:.1f}")
-                else:
-                    row.append("NA")
-            writer.writerow(row)
-        
-        # Overall row
-        overall_row = ['OVERALL']
-        for filename in file_stats.keys():
-            file_total_true = sum(stats["true"] for stats in file_stats[filename].values())
-            file_total_false = sum(stats["false"] for stats in file_stats[filename].values())
-            file_total_all = file_total_true + file_total_false
-            file_overall_accuracy = (file_total_true / file_total_all * 100) if file_total_all > 0 else 0.0
-            overall_row.append(f"{file_overall_accuracy:.1f}")
-        writer.writerow(overall_row)
+    return {
+        "file": relpath(jsonl_path),
+        "input_records": len(records),
+        "invalid_json_lines": invalid_json_lines,
+        "missing_key_records": missing_key_records,
+        "empty_context_records": empty_context_records,
+        **summarize_stats(overall_stats),
+        "by_pattern_type": by_pattern_type,
+    }
 
-def save_explanations_matrix_csv(file_stats: Dict[str, Dict[str, Dict[str, int]]], pattern_types: List[str], output_path: str):
-    """Save % Truthful Explanations matrix as CSV (Pattern Type vs Files)."""
-    with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
-        writer = csv.writer(csvfile)
-        
-        # Header with file names
-        header = ['Pattern Type'] + list(file_stats.keys())
-        writer.writerow(header)
-        
-        # Data rows for each pattern type
-        for p_type in pattern_types:
-            row = [p_type]
-            for filename in file_stats.keys():
-                stats = file_stats[filename].get(p_type, {"count": 0, "perfect": 0})
-                count = stats["count"]
-                if count > 0:
-                    pct_truthful = (stats["perfect"] / count * 100)
-                    row.append(f"{pct_truthful:.1f}")
-                else:
-                    row.append("NA")
-            writer.writerow(row)
-        
-        # Overall row
-        overall_row = ['OVERALL']
-        for filename in file_stats.keys():
-            file_total_perfect = sum(stats["perfect"] for stats in file_stats[filename].values())
-            file_total_records = sum(stats["count"] for stats in file_stats[filename].values())
-            file_overall_truthful = (file_total_perfect / file_total_records * 100) if file_total_records > 0 else 0.0
-            overall_row.append(f"{file_overall_truthful:.1f}")
-        writer.writerow(overall_row)
 
-def save_non_synth_metrics_csv(file_stats: Dict[str, Dict[str, Dict[str, int]]], pattern_types: List[str], output_path: str):
-    """Save non-synth mode metrics matrix as CSV (Metric vs Files) using actual file names."""
-    with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
-        writer = csv.writer(csvfile)
-        
-        # Calculate metrics for each file
-        file_metrics = {}
-        for filename in file_stats.keys():
-            total_true = sum(stats["true"] for stats in file_stats[filename].values())
-            total_false = sum(stats["false"] for stats in file_stats[filename].values())
-            total_perfect = sum(stats["perfect"] for stats in file_stats[filename].values())
-            total_records = sum(stats["count"] for stats in file_stats[filename].values())
-            total_all = total_true + total_false
-            
-            total_feature_confusion = sum(stats["feature_confusion_errors"] for stats in file_stats[filename].values())
-            total_time_imprecision = sum(stats["time_imprecision_errors"] for stats in file_stats[filename].values())
-            total_other_errors = sum(stats["other_errors"] for stats in file_stats[filename].values())
-            total_errors = total_feature_confusion + total_time_imprecision + total_other_errors
-            
-            file_metrics[filename] = {
-                "correct_citations": (total_true / total_all * 100) if total_all > 0 else 0.0,
-                "truthful_explanations": (total_perfect / total_records * 100) if total_records > 0 else 0.0,
-                "feature_confusion": (total_feature_confusion / total_errors * 100) if total_errors > 0 else 0.0,
-                "temporal_confusion": (total_time_imprecision / total_errors * 100) if total_errors > 0 else 0.0
+def split_experiment_and_run(
+    jsonl_path: Path,
+    include_unmatched: bool = False,
+) -> Optional[Tuple[str, Optional[int]]]:
+    stem = jsonl_path.stem
+    match = RUN_SUFFIX_RE.match(stem)
+
+    if match:
+        return match.group("experiment"), int(match.group("run"))
+
+    if include_unmatched:
+        return stem, None
+
+    return None
+
+
+def discover_jsonl_files(
+    input_paths: List[str],
+    pattern: str,
+    recursive: bool,
+) -> List[Path]:
+    files: List[Path] = []
+
+    for raw_path in input_paths:
+        path = Path(raw_path)
+
+        if path.is_file():
+            if path.suffix == ".jsonl":
+                files.append(path)
+            else:
+                print(f"Warning: ignored non-JSONL file: {path}", file=sys.stderr)
+            continue
+
+        if path.is_dir():
+            glob_pattern = f"**/{pattern}" if recursive else pattern
+            files.extend(sorted(path.glob(glob_pattern)))
+            continue
+
+        print(f"Warning: input path does not exist: {path}", file=sys.stderr)
+
+    return sorted({p.resolve() for p in files if p.is_file() and p.suffix == ".jsonl"})
+
+
+def group_files_by_experiment(
+    files: List[Path],
+    include_unmatched: bool,
+) -> Tuple[Dict[Tuple[Path, str], List[Dict[str, Any]]], List[str]]:
+    groups: Dict[Tuple[Path, str], List[Dict[str, Any]]] = defaultdict(list)
+    warnings: List[str] = []
+
+    for jsonl_path in files:
+        parsed = split_experiment_and_run(jsonl_path, include_unmatched=include_unmatched)
+
+        if parsed is None:
+            warnings.append(
+                f"Ignored file without final run suffix '-N': {relpath(jsonl_path)}"
+            )
+            continue
+
+        experiment, run_id = parsed
+        directory = jsonl_path.parent.resolve()
+
+        groups[(directory, experiment)].append(
+            {
+                "path": jsonl_path,
+                "run_id": run_id,
             }
-        
-        # Header with actual file names (not TS1, TS2, etc.)
-        header = ['Metric'] + list(file_stats.keys())
-        writer.writerow(header)
-        
-        # Metric rows
-        metrics = [
-            ('% Correct citations', 'correct_citations'),
-            ('% Fully truthful explanations', 'truthful_explanations'),
-            ('% Errors - feature confusion', 'feature_confusion'),
-            ('% Errors - temporal confusion', 'temporal_confusion')
-        ]
-        
-        for metric_name, metric_key in metrics:
-            row = [metric_name]
-            for filename in file_stats.keys():
-                row.append(f"{file_metrics[filename][metric_key]:.1f}")
-            writer.writerow(row)
+        )
 
-def print_summary_table(stats: Dict[str, Dict[str, int]], total_records: int):
-    """Print summary table exactly like original script."""
-    width = 85
-    print("\n" + "="*width)
-    print(f" EVALUATION SUMMARY (Total Records: {total_records})")
-    print("="*width)
+    return groups, warnings
 
-    print(f"{'PATTERN TYPE':<20} | {'AVG TRUE':<8} | {'AVG FALSE':<9} | {'ACCURACY':<8} | {'% CLEAN':<7}")
-    print("-" * width)
 
-    grand_true = 0
-    grand_false = 0
-    grand_perfect = 0
+def aggregate_metric_records(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
 
-    for p_type in sorted(stats.keys()):
-        s = stats[p_type]
-        count = s["count"]
-        if count == 0:
-            continue
+    for metric in SUMMARY_METRICS:
+        values = [record.get(metric) for record in records]
+        out[f"{metric}_mean"] = safe_mean(values)
+        out[f"{metric}_std"] = safe_std(values)
 
-        avg_true = s["true"] / count
-        avg_false = s["false"] / count
+    for metric in COUNT_METRICS:
+        values = [record.get(metric) for record in records]
+        out[f"{metric}_mean"] = safe_mean(values)
+        out[f"{metric}_sum"] = sum(float(v) for v in values if v is not None)
 
-        total_facts = s["true"] + s["false"]
-        accuracy = (s["true"] / total_facts * 100) if total_facts > 0 else 0.0
+    return out
 
-        pct_perfect = (s["perfect"] / count * 100)
 
-        grand_true += s["true"]
-        grand_false += s["false"]
-        grand_perfect += s["perfect"]
-
-        print(f"{p_type:<20} | {avg_true:<8.2f} | {avg_false:<9.2f} | {accuracy:>6.1f}%  | {pct_perfect:>6.1f}%")
-
-    print("-" * width)
-
-    if total_records > 0:
-        g_avg_true = grand_true / total_records
-        g_avg_false = grand_false / total_records
-        g_total = grand_true + grand_false
-        g_acc = (grand_true / g_total * 100) if g_total > 0 else 0.0
-        g_pct_perf = (grand_perfect / total_records * 100)
-
-        print(f"{'OVERALL':<20} | {g_avg_true:<8.2f} | {g_avg_false:<9.2f} | {g_acc:>6.1f}%  | {g_pct_perf:>6.1f}%")
-    print("="*width + "\n")
-
-def print_error_attribution_summary(stats: Dict[str, Dict[str, int]], total_records: int):
-    """Print error attribution summary exactly like original script."""
-    width = 85
-    print("\n" + "=" * width)
-    print(f" ERROR ATTRIBUTION (among FALSE citations) (Total Records: {total_records})")
-    print("=" * width)
-
-    print(f"{'PATTERN TYPE':<20} | {'FALSE':<6} | {'% FEAT CONF':<11} | {'% TIME ±2':<10} | {'% OTHER':<7}")
-    print("-" * width)
-
-    g_false = 0
-    g_fc = 0
-    g_ti = 0
-    g_other = 0
-
-    for p_type in sorted(stats.keys()):
-        s = stats[p_type]
-        f = s.get("false", 0)
-
-        fc = s.get("feature_confusion_errors", 0)
-        ti = s.get("time_imprecision_errors", 0)
-        oth = s.get("other_errors", 0)
-
-        if f > 0:
-            p_fc = 100 * fc / f
-            p_ti = 100 * ti / f
-            p_oth = 100 * oth / f
-        else:
-            p_fc = p_ti = p_oth = 0.0
-
-        g_false += f
-        g_fc += fc
-        g_ti += ti
-        g_other += oth
-
-        print(f"{p_type:<20} | {f:<6d} | {p_fc:>9.1f}%  | {p_ti:>8.1f}%  | {p_oth:>6.1f}%")
-
-    print("-" * width)
-
-    if g_false > 0:
-        g_p_fc = 100 * g_fc / g_false
-        g_p_ti = 100 * g_ti / g_false
-        g_p_oth = 100 * g_other / g_false
-    else:
-        g_p_fc = g_p_ti = g_p_oth = 0.0
-
-    print(f"{'OVERALL':<20} | {g_false:<6d} | {g_p_fc:>9.1f}%  | {g_p_ti:>8.1f}%  | {g_p_oth:>6.1f}%")
-    print("=" * width + "\n")
-
-def print_synth_summary(stats: Dict[str, Dict[str, int]], total_records: int):
-    """Print synth mode summary with pattern type breakdown."""
-    print(f"\n{'='*100}")
-    print(f"CITATION VERIFICATION SUMMARY - SYNTH MODE (Total Records: {total_records})")
-    print(f"{'='*100}")
-    
-    # Get all pattern types
-    pattern_types = sorted(stats.keys())
-    
-    # Print header
-    header = f"{'Pattern Type':<20} | {'Records':<8} | {'Avg True':<8} | {'Avg False':<9} | {'Accuracy':<8} | {'% Clean':<7}"
-    print(header)
-    print("-" * 85)
-    
-    # Print each pattern type
-    for p_type in pattern_types:
-        s = stats[p_type]
-        count = s["count"]
-        if count == 0:
-            continue
-
-        avg_true = s["true"] / count
-        avg_false = s["false"] / count
-        total_facts = s["true"] + s["false"]
-        accuracy = (s["true"] / total_facts * 100) if total_facts > 0 else 0.0
-        pct_perfect = (s["perfect"] / count * 100)
-
-        print(f"{p_type:<20} | {count:<8d} | {avg_true:<8.2f} | {avg_false:<9.2f} | {accuracy:>6.1f}%  | {pct_perfect:>6.1f}%")
-    
-    print("-" * 85)
-    
-    # Overall totals
-    if total_records > 0:
-        grand_true = sum(s["true"] for s in stats.values())
-        grand_false = sum(s["false"] for s in stats.values())
-        grand_perfect = sum(s["perfect"] for s in stats.values())
-        
-        g_avg_true = grand_true / total_records
-        g_avg_false = grand_false / total_records
-        g_total = grand_true + grand_false
-        g_acc = (grand_true / g_total * 100) if g_total > 0 else 0.0
-        g_pct_perf = (grand_perfect / total_records * 100)
-
-        print(f"{'OVERALL':<20} | {total_records:<8d} | {g_avg_true:<8.2f} | {g_avg_false:<9.2f} | {g_acc:>6.1f}%  | {g_pct_perf:>6.1f}%")
-    
-    print("="*100)
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Citation Verification Metrics Summary - Processes multiple JSONL files and summarizes citation verification metrics",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python citation_verification_summary.py results/*.jsonl
-  python citation_verification_summary.py --prompt-key context --answer-key output --plain-text results/*.jsonl
-  python citation_verification_summary.py --synth --out-citations citations.csv --out-explanations explanations.csv results/*.jsonl
-  python citation_verification_summary.py --out-metrics metrics.csv results/*.jsonl
-        """
+def aggregate_pattern_types(run_metrics: List[Dict[str, Any]]) -> Dict[str, Any]:
+    all_pattern_types = sorted(
+        {
+            pattern_type
+            for metrics in run_metrics
+            for pattern_type in metrics.get("by_pattern_type", {}).keys()
+        }
     )
-    
-    parser.add_argument("jsonl_files", nargs="+", type=str, 
-                       help="JSONL files to process (can use wildcards)")
-    parser.add_argument("--prompt-key", default="input",
-                       help="JSON key containing the data context (default: 'input')")
-    parser.add_argument("--answer-key", default="output", 
-                       help="JSON key containing the text to evaluate (default: 'input')")
-    parser.add_argument("--plain-text", action="store_true",
-                       help="Parse context as 'timestamp: X, feature: Y, ...' instead of 'ts : v1, v2, ...'")
-    parser.add_argument("--synth", action="store_true",
-                       help="Enable synthetic data mode (show breakdown by pattern type)")
-    parser.add_argument("--out-citations", type=str, default=None,
-                       help="Save Correct Citations matrix as CSV to specified file (synth mode only)")
-    parser.add_argument("--out-explanations", type=str, default=None,
-                       help="Save Truthful Explanations matrix as CSV to specified file (synth mode only)")
-    parser.add_argument("--out-metrics", type=str, default=None,
-                       help="Save metrics matrix as CSV to specified file (non-synth mode only)")
-    
+
+    out: Dict[str, Any] = {}
+
+    for pattern_type in all_pattern_types:
+        records = [
+            metrics["by_pattern_type"][pattern_type]
+            for metrics in run_metrics
+            if pattern_type in metrics.get("by_pattern_type", {})
+        ]
+
+        out[pattern_type] = {
+            **aggregate_metric_records(records),
+            "n_runs_with_pattern_type": len(records),
+        }
+
+    return out
+
+
+def aggregate_experiment_group(
+    directory: Path,
+    experiment: str,
+    run_items: List[Dict[str, Any]],
+    args: argparse.Namespace,
+) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+    warnings: List[str] = []
+
+    sorted_items = sorted(
+        run_items,
+        key=lambda item: (
+            item["run_id"] is None,
+            item["run_id"] if item["run_id"] is not None else 10**9,
+            item["path"].name,
+        ),
+    )
+
+    seen_run_ids: Dict[int, int] = defaultdict(int)
+    runs: List[Dict[str, Any]] = []
+
+    for item in sorted_items:
+        path = item["path"]
+        run_id = item["run_id"]
+
+        if run_id is not None:
+            seen_run_ids[run_id] += 1
+
+        try:
+            metrics = process_single_jsonl(
+                jsonl_path=path,
+                prompt_key=args.prompt_key,
+                answer_key=args.answer_key,
+                plain_text=args.plain_text,
+                context_window=args.context_window,
+                max_failed_examples=args.max_failed_examples,
+            )
+        except Exception as exc:
+            warnings.append(f"Failed to process {relpath(path)}: {exc}")
+            continue
+
+        runs.append(
+            {
+                "run_id": run_id,
+                "file": relpath(path),
+                "metrics": metrics,
+            }
+        )
+
+    if not runs:
+        return None, warnings
+
+    duplicate_run_ids = sorted(
+        run_id for run_id, count in seen_run_ids.items() if count > 1
+    )
+
+    if duplicate_run_ids:
+        warnings.append(
+            f"Duplicate run ids for {relpath(directory)}/{experiment}: {duplicate_run_ids}"
+        )
+
+    observed_run_ids = sorted(
+        run["run_id"]
+        for run in runs
+        if run["run_id"] is not None
+    )
+
+    missing_run_ids: List[int] = []
+
+    if args.expected_runs is not None and args.expected_runs > 0:
+        expected = set(range(1, args.expected_runs + 1))
+        observed = set(observed_run_ids)
+        missing_run_ids = sorted(expected - observed)
+
+        if missing_run_ids:
+            warnings.append(
+                f"Missing run ids for {relpath(directory)}/{experiment}: {missing_run_ids}"
+            )
+
+    run_metrics = [run["metrics"] for run in runs]
+
+    return {
+        "directory": relpath(directory),
+        "experiment": experiment,
+        "label": f"{relpath(directory)}/{experiment}",
+        "n_runs": len(runs),
+        "run_ids": observed_run_ids,
+        "missing_run_ids": missing_run_ids,
+        "runs": runs,
+        **aggregate_metric_records(run_metrics),
+        "by_pattern_type": aggregate_pattern_types(run_metrics),
+    }, warnings
+
+
+def build_summary(args: argparse.Namespace) -> Dict[str, Any]:
+    files = discover_jsonl_files(
+        input_paths=args.paths,
+        pattern=args.pattern,
+        recursive=args.recursive,
+    )
+
+    groups, warnings = group_files_by_experiment(
+        files,
+        include_unmatched=args.include_unmatched,
+    )
+
+    experiments: List[Dict[str, Any]] = []
+
+    for (directory, experiment), run_items in sorted(
+        groups.items(),
+        key=lambda kv: (str(kv[0][0]), kv[0][1]),
+    ):
+        result, group_warnings = aggregate_experiment_group(
+            directory=directory,
+            experiment=experiment,
+            run_items=run_items,
+            args=args,
+        )
+
+        warnings.extend(group_warnings)
+
+        if result is not None:
+            experiments.append(result)
+
+    return {
+        "inputs": args.paths,
+        "pattern": args.pattern,
+        "recursive": args.recursive,
+        "expected_runs": args.expected_runs,
+        "prompt_key": args.prompt_key,
+        "answer_key": args.answer_key,
+        "plain_text": args.plain_text,
+        "n_files_discovered": len(files),
+        "n_experiments": len(experiments),
+        "experiments": experiments,
+        "warnings": warnings,
+    }
+
+
+def experiment_to_csv_row(exp: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "directory": exp["directory"],
+        "experiment": exp["experiment"],
+        "label": exp["label"],
+        "n_runs": exp["n_runs"],
+        "run_ids": ",".join(str(x) for x in exp["run_ids"]),
+        "missing_run_ids": ",".join(str(x) for x in exp["missing_run_ids"]),
+
+        "processed_records_mean": exp.get("processed_records_mean"),
+        "total_citations_mean": exp.get("total_citations_mean"),
+        "true_citations_mean": exp.get("true_citations_mean"),
+        "false_citations_mean": exp.get("false_citations_mean"),
+        "perfect_records_mean": exp.get("perfect_records_mean"),
+
+        "avg_true_per_record_mean": exp.get("avg_true_per_record_mean"),
+        "avg_false_per_record_mean": exp.get("avg_false_per_record_mean"),
+
+        "correct_citations_percent_mean": exp.get("correct_citations_percent_mean"),
+        "correct_citations_percent_std": exp.get("correct_citations_percent_std"),
+
+        "fully_truthful_explanations_percent_mean": exp.get(
+            "fully_truthful_explanations_percent_mean"
+        ),
+        "fully_truthful_explanations_percent_std": exp.get(
+            "fully_truthful_explanations_percent_std"
+        ),
+
+        "feature_confusion_frequency_percent_mean": exp.get(
+            "feature_confusion_frequency_percent_mean"
+        ),
+        "feature_confusion_frequency_percent_std": exp.get(
+            "feature_confusion_frequency_percent_std"
+        ),
+
+        "time_confusion_frequency_percent_mean": exp.get(
+            "time_confusion_frequency_percent_mean"
+        ),
+        "time_confusion_frequency_percent_std": exp.get(
+            "time_confusion_frequency_percent_std"
+        ),
+
+        "other_error_frequency_percent_mean": exp.get(
+            "other_error_frequency_percent_mean"
+        ),
+        "other_error_frequency_percent_std": exp.get(
+            "other_error_frequency_percent_std"
+        ),
+
+        "feature_confusion_errors_mean": exp.get("feature_confusion_errors_mean"),
+        "time_imprecision_errors_mean": exp.get("time_imprecision_errors_mean"),
+        "other_errors_mean": exp.get("other_errors_mean"),
+    }
+
+
+def write_csv(summary: Dict[str, Any], out_path: Optional[Path] = None) -> None:
+    rows = [experiment_to_csv_row(exp) for exp in summary["experiments"]]
+
+    fieldnames = list(experiment_to_csv_row({
+        "directory": "",
+        "experiment": "",
+        "label": "",
+        "n_runs": 0,
+        "run_ids": [],
+        "missing_run_ids": [],
+    }).keys())
+
+    if out_path is None:
+        writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+        return
+
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_pattern_csv(summary: Dict[str, Any], out_path: Path) -> None:
+    fieldnames = [
+        "directory",
+        "experiment",
+        "label",
+        "pattern_type",
+        "n_runs_with_pattern_type",
+        "processed_records_mean",
+        "total_citations_mean",
+        "correct_citations_percent_mean",
+        "fully_truthful_explanations_percent_mean",
+        "feature_confusion_frequency_percent_mean",
+        "time_confusion_frequency_percent_mean",
+        "other_error_frequency_percent_mean",
+        "avg_true_per_record_mean",
+        "avg_false_per_record_mean",
+    ]
+
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for exp in summary["experiments"]:
+            for pattern_type, metrics in sorted(exp["by_pattern_type"].items()):
+                writer.writerow({
+                    "directory": exp["directory"],
+                    "experiment": exp["experiment"],
+                    "label": exp["label"],
+                    "pattern_type": pattern_type,
+                    "n_runs_with_pattern_type": metrics.get("n_runs_with_pattern_type"),
+                    "processed_records_mean": metrics.get("processed_records_mean"),
+                    "total_citations_mean": metrics.get("total_citations_mean"),
+                    "correct_citations_percent_mean": metrics.get(
+                        "correct_citations_percent_mean"
+                    ),
+                    "fully_truthful_explanations_percent_mean": metrics.get(
+                        "fully_truthful_explanations_percent_mean"
+                    ),
+                    "feature_confusion_frequency_percent_mean": metrics.get(
+                        "feature_confusion_frequency_percent_mean"
+                    ),
+                    "time_confusion_frequency_percent_mean": metrics.get(
+                        "time_confusion_frequency_percent_mean"
+                    ),
+                    "other_error_frequency_percent_mean": metrics.get(
+                        "other_error_frequency_percent_mean"
+                    ),
+                    "avg_true_per_record_mean": metrics.get("avg_true_per_record_mean"),
+                    "avg_false_per_record_mean": metrics.get("avg_false_per_record_mean"),
+                })
+
+
+def print_table(summary: Dict[str, Any]) -> None:
+    print()
+    print("=" * 145)
+    print("CITATION VERIFICATION METRICS SUMMARY")
+    print("=" * 145)
+    print(f"Files discovered: {summary['n_files_discovered']}")
+    print(f"Experiments:      {summary['n_experiments']}")
+    print(f"Expected runs:    {summary['expected_runs']}")
+    print(f"prompt_key:       {summary['prompt_key']}")
+    print(f"answer_key:       {summary['answer_key']}")
+    print("=" * 145)
+
+    if not summary["experiments"]:
+        print("No experiments found.")
+        return
+
+    header = (
+        f"{'Experiment':<68} "
+        f"{'Runs':>4} "
+        f"{'Missing':>8} "
+        f"{'Records':>8} "
+        f"{'Cites':>8} "
+        f"{'% Correct':>10} "
+        f"{'% Clean':>9} "
+        f"{'% Feat':>8} "
+        f"{'% Time':>8} "
+        f"{'% Other':>8} "
+        f"{'Avg T':>7} "
+        f"{'Avg F':>7}"
+    )
+
+    print(header)
+    print("-" * len(header))
+
+    for exp in summary["experiments"]:
+        missing = (
+            "-"
+            if not exp["missing_run_ids"]
+            else ",".join(str(x) for x in exp["missing_run_ids"])
+        )
+
+        print(
+            f"{exp['label']:<68} "
+            f"{exp['n_runs']:>4} "
+            f"{missing:>8} "
+            f"{fmt_count(exp.get('processed_records_mean')):>8} "
+            f"{fmt_count(exp.get('total_citations_mean')):>8} "
+            f"{fmt_float(exp.get('correct_citations_percent_mean')):>10} "
+            f"{fmt_float(exp.get('fully_truthful_explanations_percent_mean')):>9} "
+            f"{fmt_float(exp.get('feature_confusion_frequency_percent_mean')):>8} "
+            f"{fmt_float(exp.get('time_confusion_frequency_percent_mean')):>8} "
+            f"{fmt_float(exp.get('other_error_frequency_percent_mean')):>8} "
+            f"{fmt_float(exp.get('avg_true_per_record_mean')):>7} "
+            f"{fmt_float(exp.get('avg_false_per_record_mean')):>7}"
+        )
+
+    if summary["warnings"]:
+        print()
+        print("Warnings:")
+        for warning in summary["warnings"]:
+            print(f"- {warning}")
+
+
+def save_output(summary: Dict[str, Any], out_path: Path) -> None:
+    if out_path.suffix.lower() == ".json":
+        out_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        print(f"\nSaved JSON report to {out_path}")
+        return
+
+    write_csv(summary, out_path=out_path)
+    print(f"\nSaved CSV report to {out_path}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Aggregate citation verification metrics across JSONL experiment runs."
+    )
+
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        type=str,
+        help="One or several directories/files to aggregate.",
+    )
+
+    parser.add_argument(
+        "--prompt-key",
+        default="input",
+        help="JSON key containing the data context. Default: input.",
+    )
+
+    parser.add_argument(
+        "--answer-key",
+        default="output",
+        help="JSON key containing the text to evaluate. Default: output.",
+    )
+
+    parser.add_argument(
+        "--plain-text",
+        action="store_true",
+        help="Parse context as 'timestamp: X, feature: Y, ...'.",
+    )
+
+    parser.add_argument(
+        "--context-window",
+        type=int,
+        default=4,
+        help="Context window passed to verify_citations. Default: 4.",
+    )
+
+    parser.add_argument(
+        "--max-failed-examples",
+        type=int,
+        default=5,
+        help="Max failed examples kept per record. Default: 5.",
+    )
+
+    parser.add_argument(
+        "--expected-runs",
+        type=int,
+        default=3,
+        help="Expected number of runs per experiment. Default: 3.",
+    )
+
+    parser.add_argument(
+        "--pattern",
+        type=str,
+        default="*.jsonl",
+        help="Glob pattern used inside directories. Default: *.jsonl.",
+    )
+
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Search JSONL files recursively inside input directories.",
+    )
+
+    parser.add_argument(
+        "--include-unmatched",
+        action="store_true",
+        help="Include JSONL files without final '-N' suffix as single-run experiments.",
+    )
+
+    parser.add_argument(
+        "--format",
+        choices=["table", "csv", "json"],
+        default="table",
+        help="Stdout format. Default: table.",
+    )
+
+    parser.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help="Optional output path. Use .json for full nested report, otherwise CSV.",
+    )
+
+    parser.add_argument(
+        "--out-patterns",
+        type=str,
+        default=None,
+        help="Optional long CSV with per-pattern-type aggregated metrics.",
+    )
+
     args = parser.parse_args()
-    
-    if not args.jsonl_files:
-        print("Error: No JSONL files provided", file=sys.stderr)
-        sys.exit(1)
-    
-    # Validate CSV arguments
-    if args.synth and (args.out_citations or args.out_explanations):
-        if not args.out_citations or not args.out_explanations:
-            print("Error: When using --synth mode with CSV export, both --out-citations and --out-explanations must be specified", file=sys.stderr)
-            sys.exit(1)
-    
-    if not args.synth and args.out_metrics:
-        # Non-synth mode with metrics export is valid
-        pass
-    elif not args.synth and (args.out_citations or args.out_explanations):
-        print("Error: --out-citations and --out-explanations are only available in synth mode", file=sys.stderr)
-        sys.exit(1)
-    
-    # Convert file paths to Path objects and filter existing files
-    jsonl_paths = []
-    for file_pattern in args.jsonl_files:
-        path = Path(file_pattern)
-        if path.exists():
-            jsonl_paths.append(path)
-        else:
-            # Try glob pattern
-            import glob
-            matches = glob.glob(file_pattern)
-            for match in matches:
-                match_path = Path(match)
-                if match_path.exists():
-                    jsonl_paths.append(match_path)
-    
-    if not jsonl_paths:
-        print("Error: No valid JSONL files found", file=sys.stderr)
-        sys.exit(1)
-    
-    print(f"Processing {len(jsonl_paths)} JSONL files...")
-    print(f"Using prompt_key='{args.prompt_key}', answer_key='{args.answer_key}'")
-    if args.plain_text:
-        print("Using plain-text parsing mode")
-    
-    # Process each file and collect results
-    all_file_results = []
-    for jsonl_path in jsonl_paths:
-        print(f"  Processing: {jsonl_path.name}")
-        file_result = process_single_jsonl_file(jsonl_path, args.prompt_key, args.answer_key, args.plain_text)
-        all_file_results.append(file_result)
-    
-    # Aggregate stats by file for matrix format
-    aggregated = aggregate_stats_by_file(all_file_results)
-    file_stats = aggregated["file_stats"]
-    pattern_types = aggregated["pattern_types"]
-    
-    if not file_stats or not pattern_types:
-        print("Error: No records with valid citations found", file=sys.stderr)
-        sys.exit(1)
-    
-    # Print summaries
-    if args.synth:
-        # For display, aggregate all files together
-        total_records = sum(sum(stats["count"] for stats in file_stats[filename].values()) for filename in file_stats.keys())
-        aggregated_stats = {}
-        for p_type in pattern_types:
-            aggregated_stats[p_type] = {
-                "count": sum(file_stats[filename].get(p_type, {}).get("count", 0) for filename in file_stats.keys()),
-                "true": sum(file_stats[filename].get(p_type, {}).get("true", 0) for filename in file_stats.keys()),
-                "false": sum(file_stats[filename].get(p_type, {}).get("false", 0) for filename in file_stats.keys()),
-                "perfect": sum(file_stats[filename].get(p_type, {}).get("perfect", 0) for filename in file_stats.keys()),
-                "feature_confusion_errors": sum(file_stats[filename].get(p_type, {}).get("feature_confusion_errors", 0) for filename in file_stats.keys()),
-                "time_imprecision_errors": sum(file_stats[filename].get(p_type, {}).get("time_imprecision_errors", 0) for filename in file_stats.keys()),
-                "other_errors": sum(file_stats[filename].get(p_type, {}).get("other_errors", 0) for filename in file_stats.keys()),
-            }
-        print_synth_summary(aggregated_stats, total_records)
+
+    summary = build_summary(args)
+
+    if args.format == "json":
+        print(json.dumps(summary, indent=2))
+    elif args.format == "csv":
+        write_csv(summary, out_path=None)
     else:
-        # For non-synth, show simple aggregated summary
-        total_records = sum(sum(stats["count"] for stats in file_stats[filename].values()) for filename in file_stats.keys())
-        aggregated_stats = {}
-        for p_type in pattern_types:
-            aggregated_stats[p_type] = {
-                "count": sum(file_stats[filename].get(p_type, {}).get("count", 0) for filename in file_stats.keys()),
-                "true": sum(file_stats[filename].get(p_type, {}).get("true", 0) for filename in file_stats.keys()),
-                "false": sum(file_stats[filename].get(p_type, {}).get("false", 0) for filename in file_stats.keys()),
-                "perfect": sum(file_stats[filename].get(p_type, {}).get("perfect", 0) for filename in file_stats.keys()),
-                "feature_confusion_errors": sum(file_stats[filename].get(p_type, {}).get("feature_confusion_errors", 0) for filename in file_stats.keys()),
-                "time_imprecision_errors": sum(file_stats[filename].get(p_type, {}).get("time_imprecision_errors", 0) for filename in file_stats.keys()),
-                "other_errors": sum(file_stats[filename].get(p_type, {}).get("other_errors", 0) for filename in file_stats.keys()),
-            }
-        print_summary_table(aggregated_stats, total_records)
-        print_error_attribution_summary(aggregated_stats, total_records)
-    
-    # Save CSV files if requested
-    if args.synth and args.out_citations and args.out_explanations:
-        save_citations_matrix_csv(file_stats, pattern_types, args.out_citations)
-        save_explanations_matrix_csv(file_stats, pattern_types, args.out_explanations)
-        print(f"\nSaved % Correct Citations matrix to: {args.out_citations}")
-        print(f"Saved % Truthful Explanations matrix to: {args.out_explanations}")
-    elif not args.synth and args.out_metrics:
-        save_non_synth_metrics_csv(file_stats, pattern_types, args.out_metrics)
-        print(f"\nSaved metrics matrix to: {args.out_metrics}")
+        print_table(summary)
+
+    if args.out:
+        save_output(summary, Path(args.out))
+
+    if args.out_patterns:
+        write_pattern_csv(summary, Path(args.out_patterns))
+        print(f"\nSaved per-pattern CSV report to {args.out_patterns}")
+
 
 if __name__ == "__main__":
     main()

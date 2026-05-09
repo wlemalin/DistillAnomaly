@@ -1,447 +1,689 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-Multi-JSONL Affiliation Metrics Summary
+Aggregate affiliation metrics over several experiment directories.
 
-Processes multiple JSONL files using the affiliation metrics backend logic
-and produces a consolidated summary table. Accepts JSONL files as command-line
-arguments for precise control over order and filtering.
+Expected file naming convention:
 
-Usage:
-    python multi_affiliation_summary.py file1.jsonl file2.jsonl file3.jsonl
-    python multi_affiliation_summary.py --synth --out summary.json results/*.jsonl
+    experiment-name-1.jsonl
+    experiment-name-2.jsonl
+    experiment-name-3.jsonl
+
+The final "-N" suffix is treated as the run id.
+All runs belonging to the same experiment are averaged together.
+
+This script imports metric/parsing logic from affiliation_metrics.py.
 """
 
 import argparse
+import csv
 import json
+import os
 import re
+import statistics
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import pandas as pd
-
-# ========== COPY YOUR ENTIRE BACKEND LOGIC HERE ==========
-# (All the imports, dataclasses, parsing functions, metric computation, etc.)
-
-
-_JSON_FENCE_RE = re.compile(
-    r"```(?:json)?\s*(\{.*?\})\s*```",
-    flags=re.IGNORECASE | re.DOTALL,
+from affil_overview import (
+    compute_affiliation_single,
+    f1_from_pr,
+    load_jsonl,
+    parse_gt_interval,
+    parse_pred_interval,
 )
 
 
-def _try_json_loads_maybe_double_encoded(s: str) -> Any:
-    obj = json.loads(s)
-    if isinstance(obj, str):
-        obj2 = json.loads(obj)
-        return obj2
-    return obj
+RUN_SUFFIX_RE = re.compile(r"^(?P<experiment>.+)-(?P<run>\d+)$")
 
 
-def _extract_json_object_text(raw: str) -> Optional[str]:
-    s = raw.strip()
-    m = _JSON_FENCE_RE.search(s)
-    if m:
-        return m.group(1).strip()
-    i = s.find("{")
-    j = s.rfind("}")
-    if i != -1 and j != -1 and j > i:
-        return s[i: j + 1].strip()
+NUMERIC_METRICS = [
+    "precision",
+    "recall",
+    "f1",
+    "avg_d_pred_to_gt",
+    "avg_d_gt_to_pred",
+    "invalid_detection_rate_percent",
+]
+
+COUNT_METRICS = [
+    "total_rows",
+    "total_with_gt",
+    "valid_predictions",
+    "invalid_predictions",
+]
+
+
+def safe_mean(values: Iterable[Optional[float]]) -> Optional[float]:
+    xs = [float(v) for v in values if v is not None]
+    return sum(xs) / len(xs) if xs else None
+
+
+def safe_std(values: Iterable[Optional[float]]) -> Optional[float]:
+    xs = [float(v) for v in values if v is not None]
+    if len(xs) <= 1:
+        return 0.0 if len(xs) == 1 else None
+    return statistics.stdev(xs)
+
+
+def fmt_float(value: Optional[float], decimals: int = 4) -> str:
+    if value is None:
+        return "NA"
+    return f"{value:.{decimals}f}"
+
+
+def fmt_count(value: Optional[float]) -> str:
+    if value is None:
+        return "NA"
+    if abs(value - round(value)) < 1e-9:
+        return str(int(round(value)))
+    return f"{value:.2f}"
+
+
+def relpath(path: Path) -> str:
+    try:
+        return os.path.relpath(path, Path.cwd())
+    except ValueError:
+        return str(path)
+
+
+def split_experiment_and_run(
+    jsonl_path: Path,
+    include_unmatched: bool = False,
+) -> Optional[Tuple[str, Optional[int]]]:
+    """
+    Convert:
+
+        eval-qwen-v3-outsample-dpop-bt-ep6-1.jsonl
+
+    into:
+
+        ("eval-qwen-v3-outsample-dpop-bt-ep6", 1)
+
+    By default, files without a final "-N" suffix are ignored.
+    """
+    stem = jsonl_path.stem
+    match = RUN_SUFFIX_RE.match(stem)
+
+    if match:
+        return match.group("experiment"), int(match.group("run"))
+
+    if include_unmatched:
+        return stem, None
+
     return None
 
 
-@dataclass(frozen=True)
-class Interval:
-    start: int
-    end: int
+def discover_jsonl_files(
+    input_paths: List[str],
+    pattern: str,
+    recursive: bool,
+) -> List[Path]:
+    files: List[Path] = []
 
-    def length(self) -> int:
-        return max(0, self.end - self.start)
+    for raw_path in input_paths:
+        path = Path(raw_path)
 
-    def distance_to_point(self, t: int) -> int:
-        if t < self.start:
-            return self.start - t
-        if t >= self.end:
-            return t - self.end
-        return 0
+        if path.is_file():
+            if path.suffix == ".jsonl":
+                files.append(path)
+            else:
+                print(f"Warning: ignored non-JSONL file: {path}", file=sys.stderr)
+            continue
 
+        if path.is_dir():
+            glob_pattern = f"**/{pattern}" if recursive else pattern
+            files.extend(sorted(path.glob(glob_pattern)))
+            continue
 
-def clip_to_domain(iv: Interval, T0: int, T1: int) -> Interval:
-    s = max(iv.start, T0)
-    e = min(iv.end, T1)
-    if e < s:
-        e = s
-    return Interval(s, e)
+        print(f"Warning: input path does not exist: {path}", file=sys.stderr)
 
-
-def survival_precision(d: int, len_gt: int, A: int, B: int, a: int, b: int) -> float:
-    if d == 0:
-        return 1.0
-    len_I = B - A
-    if len_I <= 0:
-        return 0.0
-    left_cap = a - A
-    right_cap = B - b
-    neigh = len_gt + min(d, left_cap) + min(d, right_cap)
-    val = 1.0 - (neigh / float(len_I))
-    return 0.0 if val < 0.0 else (1.0 if val > 1.0 else val)
+    unique_files = sorted({p.resolve() for p in files if p.is_file() and p.suffix == ".jsonl"})
+    return unique_files
 
 
-def survival_recall(d: int, A: int, B: int, y: int) -> float:
-    if d == 0:
-        return 1.0
-    len_I = B - A
-    if len_I <= 0:
-        return 0.0
-    neigh = min(d, y - A) + min(d, B - y)
-    val = 1.0 - (neigh / float(len_I))
-    return 0.0 if val < 0.0 else (1.0 if val > 1.0 else val)
+def process_single_jsonl(jsonl_path: Path, T0: int, T1: int) -> Dict[str, Any]:
+    """
+    Compute strict affiliation metrics for one JSONL file.
 
-
-def parse_gt_interval(row: Dict[str, Any]) -> Optional[Interval]:
-    gts = row.get("ground_truth", [])
-    if not gts:
-        return None
-    s, e = int(gts[0][0]), int(gts[0][1])
-    return Interval(s, e + 1)
-
-
-def parse_pred_interval(row: Dict[str, Any]) -> Optional[Interval]:
-    try:
-        if "generated_output" in row:
-            raw = row["generated_output"]
-        elif "output" in row:
-            raw = row["output"]
-        else:
-            raw = "{}"
-
-        if isinstance(raw, dict):
-            go = raw
-        else:
-            if not isinstance(raw, str):
-                raw = str(raw)
-            s = raw.strip()
-            try:
-                go = _try_json_loads_maybe_double_encoded(s)
-            except Exception:
-                extracted = _extract_json_object_text(s)
-                if not extracted:
-                    return None
-                try:
-                    go = _try_json_loads_maybe_double_encoded(extracted)
-                except Exception:
-                    ex = extracted.strip()
-                    if (len(ex) >= 2) and ((ex[0] == ex[-1]) and ex[0] in ("'", '"')):
-                        ex = ex[1:-1].strip()
-                        go = _try_json_loads_maybe_double_encoded(ex)
-                    else:
-                        return None
-
-        if not isinstance(go, dict):
-            return None
-
-        anomalies = go.get("anomalies", [])
-        if not anomalies:
-            return None
-
-        first = anomalies[0]
-        if isinstance(first, dict) and "start" in first and "end" in first:
-            s_idx, e_idx = int(first["start"]), int(first["end"])
-        elif isinstance(first, (list, tuple)) and len(first) >= 2:
-            s_idx, e_idx = int(first[0]), int(first[1])
-        else:
-            return None
-
-        if e_idx < s_idx:
-            s_idx, e_idx = e_idx, s_idx
-
-        return Interval(s_idx, e_idx + 1)
-    except Exception:
-        return None
-
-
-def compute_affiliation_single(
-    T0: int, T1: int, gt: Optional[Interval], pred: Optional[Interval]
-) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
-    if gt is None:
-        return (None, None, None, None)
-
-    A, B = T0, T1
-    gt_c = clip_to_domain(gt, A, B)
-    if gt_c.length() == 0:
-        return (None, None, None, None)
-
-    if pred is not None:
-        pred_c = clip_to_domain(pred, A, B)
-        has_pred = pred_c.length() > 0
-    else:
-        pred_c = None
-        has_pred = False
-
-    precision = None
-    avg_d_pred_to_gt = None
-    if has_pred:
-        len_gt = gt_c.length()
-        a, b = gt_c.start, gt_c.end
-        surv_vals = []
-        d_vals = []
-        for t in range(pred_c.start, pred_c.end):
-            d = gt_c.distance_to_point(t)
-            d_vals.append(d)
-            s = survival_precision(d=d, len_gt=len_gt, A=A, B=B, a=a, b=b)
-            surv_vals.append(s)
-        precision = (sum(surv_vals) / len(surv_vals)) if surv_vals else None
-        avg_d_pred_to_gt = (sum(d_vals) / len(d_vals)) if d_vals else None
-
-    recall_vals = []
-    d_gt_to_pred_vals = []
-    for y in range(gt_c.start, gt_c.end):
-        if has_pred:
-            d = pred_c.distance_to_point(y)
-            d_gt_to_pred_vals.append(d)
-        else:
-            d = 10**9
-        s = survival_recall(d=d, A=A, B=B, y=y)
-        recall_vals.append(s)
-    recall = (sum(recall_vals) / len(recall_vals)) if recall_vals else None
-    avg_d_gt_to_pred = (sum(d_gt_to_pred_vals) /
-                        len(d_gt_to_pred_vals)) if d_gt_to_pred_vals else None
-
-    return (precision, recall, avg_d_pred_to_gt, avg_d_gt_to_pred)
-
-
-def f1_from_pr(p: Optional[float], r: Optional[float]) -> Optional[float]:
-    if p is None or r is None:
-        return None
-    s = p + r
-    if s <= 0:
-        return None
-    return 2.0 * p * r / s
-
-
-def load_jsonl(path: Path) -> List[Dict[str, Any]]:
-    out = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                out.append(json.loads(line))
-    return out
-
-# ========== END BACKEND LOGIC ==========
-
-
-def process_single_jsonl_synth(jsonl_path: Path, T0: int, T1: int) -> Dict[str, Any]:
-    """Process a single JSONL file in synth mode - group by pattern_type and return F1 scores."""
+    Strict convention:
+    - missing/invalid prediction => precision = 0, recall = 0, f1 = 0
+    - distance metrics are averaged only when defined
+    """
     rows = load_jsonl(jsonl_path)
 
-    # Group metrics by pattern_type
-    by_ptype_f1s: Dict[str, List[float]] = defaultdict(list)
-    all_f1s: List[float] = []  # For overall file-level F1
+    overall = {
+        "p": [],
+        "r": [],
+        "f1": [],
+        "dp2g": [],
+        "dg2p": [],
+    }
+
+    by_ptype: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {
+            "p": [],
+            "r": [],
+            "f1": [],
+            "dp2g": [],
+            "dg2p": [],
+            "total_with_gt": 0,
+            "valid_predictions": 0,
+        }
+    )
+
+    total_with_gt = 0
+    valid_pred_count = 0
 
     for row in rows:
         pt = str(row.get("pattern_type", "unknown"))
         gt = parse_gt_interval(row)
         pred = parse_pred_interval(row)
 
-        prec, rec, dP2G, dG2P = compute_affiliation_single(T0, T1, gt, pred)
+        if gt is None:
+            continue
+
+        prec, rec, dP2G, dG2P, has_pred = compute_affiliation_single(T0, T1, gt, pred)
         f1 = f1_from_pr(prec, rec)
 
-        if f1 is not None:
-            by_ptype_f1s[pt].append(f1)
-            all_f1s.append(f1)
+        total_with_gt += 1
+        by_ptype[pt]["total_with_gt"] += 1
 
-    # Calculate average F1 for each pattern type and overall
-    result = {
-        "file": str(jsonl_path.name),
-        "overall_f1": sum(all_f1s) / len(all_f1s) if all_f1s else None,
-        "by_pattern_type": {}
-    }
+        if has_pred:
+            valid_pred_count += 1
+            by_ptype[pt]["valid_predictions"] += 1
 
-    all_pattern_types: Set[str] = set(by_ptype_f1s.keys())
+        p_value = prec if prec is not None else 0.0
+        r_value = rec if rec is not None else 0.0
+        f1_value = f1 if f1 is not None else 0.0
 
-    for pt in sorted(all_pattern_types):
-        f1_list = by_ptype_f1s.get(pt, [])
-        f1_avg = sum(f1_list) / len(f1_list) if f1_list else None
-        result["by_pattern_type"][pt] = {
-            "f1": f1_avg
+        overall["p"].append(p_value)
+        overall["r"].append(r_value)
+        overall["f1"].append(f1_value)
+
+        by_ptype[pt]["p"].append(p_value)
+        by_ptype[pt]["r"].append(r_value)
+        by_ptype[pt]["f1"].append(f1_value)
+
+        if dP2G is not None:
+            overall["dp2g"].append(dP2G)
+            by_ptype[pt]["dp2g"].append(dP2G)
+
+        if dG2P is not None:
+            overall["dg2p"].append(dG2P)
+            by_ptype[pt]["dg2p"].append(dG2P)
+
+    invalid_count = total_with_gt - valid_pred_count
+    invalid_rate = (invalid_count / total_with_gt * 100.0) if total_with_gt else 0.0
+
+    by_pattern_type: Dict[str, Dict[str, Any]] = {}
+
+    for pt, bucket in sorted(by_ptype.items()):
+        pt_total = bucket["total_with_gt"]
+        pt_valid = bucket["valid_predictions"]
+        pt_invalid = pt_total - pt_valid
+        pt_invalid_rate = (pt_invalid / pt_total * 100.0) if pt_total else 0.0
+
+        by_pattern_type[pt] = {
+            "total_with_gt": pt_total,
+            "valid_predictions": pt_valid,
+            "invalid_predictions": pt_invalid,
+            "invalid_detection_rate_percent": pt_invalid_rate,
+            "precision": safe_mean(bucket["p"]),
+            "recall": safe_mean(bucket["r"]),
+            "f1": safe_mean(bucket["f1"]),
+            "avg_d_pred_to_gt": safe_mean(bucket["dp2g"]),
+            "avg_d_gt_to_pred": safe_mean(bucket["dg2p"]),
         }
 
-    return result
-
-
-def process_single_jsonl_normal(jsonl_path: Path, T0: int, T1: int) -> Dict[str, Any]:
-    """Process a single JSONL file in normal mode - return overall metrics."""
-    rows = load_jsonl(jsonl_path)
-
-    overall_precisions: List[float] = []
-    overall_recalls: List[float] = []
-    overall_f1s: List[float] = []
-
-    for row in rows:
-        pt = str(row.get("pattern_type", "unknown"))
-        gt = parse_gt_interval(row)
-        pred = parse_pred_interval(row)
-
-        prec, rec, dP2G, dG2P = compute_affiliation_single(T0, T1, gt, pred)
-        f1 = f1_from_pr(prec, rec)
-
-        if rec is not None:
-            overall_recalls.append(rec)
-        if prec is not None:
-            overall_precisions.append(prec)
-        if f1 is not None:
-            overall_f1s.append(f1)
-
     return {
-        "file": str(jsonl_path.name),
-        "precision": sum(overall_precisions)/len(overall_precisions) if overall_precisions else None,
-        "recall": sum(overall_recalls)/len(overall_recalls) if overall_recalls else None,
-        "f1": sum(overall_f1s)/len(overall_f1s) if overall_f1s else None,
+        "file": str(jsonl_path),
+        "total_rows": len(rows),
+        "total_with_gt": total_with_gt,
+        "valid_predictions": valid_pred_count,
+        "invalid_predictions": invalid_count,
+        "invalid_detection_rate_percent": invalid_rate,
+        "precision": safe_mean(overall["p"]),
+        "recall": safe_mean(overall["r"]),
+        "f1": safe_mean(overall["f1"]),
+        "avg_d_pred_to_gt": safe_mean(overall["dp2g"]),
+        "avg_d_gt_to_pred": safe_mean(overall["dg2p"]),
+        "by_pattern_type": by_pattern_type,
     }
 
 
-def main():
-    ap = argparse.ArgumentParser(
-        description="Multi-JSONL Affiliation Metrics Summary")
-    ap.add_argument("jsonl_files", nargs="+", type=str,
-                    help="JSONL files to process")
-    ap.add_argument("--T0", type=int, default=0,
-                    help="Domain start (inclusive). Default 0")
-    ap.add_argument("--T1", type=int, default=300,
-                    help="Domain end (exclusive). Default 300")
-    ap.add_argument("--out", type=str, default=None,
-                    help="Optional path to write JSON/CSV report")
-    ap.add_argument(
-        "--format", choices=["table", "csv", "json"], default="table", help="Output format")
-    ap.add_argument("--synth", action="store_true",
-                    help="Enable synthetic data specific processing (groups by pattern_type, shows F1 only)")
-    args = ap.parse_args()
+def aggregate_records(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
 
-    if not args.jsonl_files:
-        print("Error: No JSONL files provided", file=sys.stderr)
-        sys.exit(1)
+    for key in NUMERIC_METRICS:
+        values = [record.get(key) for record in records]
+        out[f"{key}_mean"] = safe_mean(values)
+        out[f"{key}_std"] = safe_std(values)
 
-    results = []
-    for jsonl_file in args.jsonl_files:
-        jsonl_path = Path(jsonl_file)
-        if not jsonl_path.exists():
-            print(f"Warning: File not found: {jsonl_file}", file=sys.stderr)
+    for key in COUNT_METRICS:
+        values = [record.get(key) for record in records]
+        out[f"{key}_mean"] = safe_mean(values)
+        out[f"{key}_sum"] = sum(float(v) for v in values if v is not None)
+
+    return out
+
+
+def aggregate_pattern_types(file_metrics: List[Dict[str, Any]]) -> Dict[str, Any]:
+    all_ptypes = sorted(
+        {
+            pt
+            for metrics in file_metrics
+            for pt in metrics.get("by_pattern_type", {}).keys()
+        }
+    )
+
+    out: Dict[str, Any] = {}
+
+    for pt in all_ptypes:
+        records = [
+            metrics["by_pattern_type"][pt]
+            for metrics in file_metrics
+            if pt in metrics.get("by_pattern_type", {})
+        ]
+
+        out[pt] = aggregate_records(records)
+        out[pt]["n_runs_with_pattern_type"] = len(records)
+
+    return out
+
+
+def group_files_by_experiment(
+    files: List[Path],
+    include_unmatched: bool,
+) -> Tuple[Dict[Tuple[Path, str], List[Dict[str, Any]]], List[str]]:
+    groups: Dict[Tuple[Path, str], List[Dict[str, Any]]] = defaultdict(list)
+    warnings: List[str] = []
+
+    for jsonl_path in files:
+        parsed = split_experiment_and_run(jsonl_path, include_unmatched=include_unmatched)
+
+        if parsed is None:
+            warnings.append(
+                f"Ignored file without final run suffix '-N': {relpath(jsonl_path)}"
+            )
             continue
+
+        experiment, run_id = parsed
+        directory = jsonl_path.parent.resolve()
+
+        groups[(directory, experiment)].append(
+            {
+                "path": jsonl_path,
+                "run_id": run_id,
+            }
+        )
+
+    return groups, warnings
+
+
+def aggregate_experiment_group(
+    directory: Path,
+    experiment: str,
+    run_items: List[Dict[str, Any]],
+    T0: int,
+    T1: int,
+    expected_runs: Optional[int],
+) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+    warnings: List[str] = []
+
+    sorted_items = sorted(
+        run_items,
+        key=lambda item: (
+            item["run_id"] is None,
+            item["run_id"] if item["run_id"] is not None else 10**9,
+            item["path"].name,
+        ),
+    )
+
+    run_results: List[Dict[str, Any]] = []
+
+    seen_run_ids: Dict[int, int] = defaultdict(int)
+
+    for item in sorted_items:
+        run_id = item["run_id"]
+        path = item["path"]
+
+        if run_id is not None:
+            seen_run_ids[run_id] += 1
 
         try:
-            if args.synth:
-                result = process_single_jsonl_synth(
-                    jsonl_path, args.T0, args.T1)
-            else:
-                result = process_single_jsonl_normal(
-                    jsonl_path, args.T0, args.T1)
-            results.append(result)
-        except Exception as e:
-            print(f"Error processing {jsonl_file}: {e}", file=sys.stderr)
+            metrics = process_single_jsonl(path, T0=T0, T1=T1)
+        except Exception as exc:
+            warnings.append(f"Failed to process {relpath(path)}: {exc}")
             continue
 
-    if not results:
-        print("Error: No files were successfully processed", file=sys.stderr)
-        sys.exit(1)
+        run_results.append(
+            {
+                "run_id": run_id,
+                "file": relpath(path),
+                "metrics": metrics,
+            }
+        )
 
-    # Print summary table
-    print(f"\n{'='*100}")
-    print(f"AFFILIATION METRICS SUMMARY ({len(results)} files)")
-    print(f"Domain: [{args.T0}, {args.T1})")
-    if args.synth:
-        print("Synthetic mode: ENABLED (grouped by pattern_type, F1 only)")
-    print(f"{'='*100}")
+    if not run_results:
+        return None, warnings
 
-    if args.synth:
-        # Synth mode: show F1 scores by pattern_type with Overall column
-        all_pattern_types: Set[str] = set()
-        for result in results:
-            all_pattern_types.update(result["by_pattern_type"].keys())
+    duplicate_run_ids = sorted(
+        run_id for run_id, count in seen_run_ids.items() if count > 1
+    )
 
-        pattern_types = sorted(all_pattern_types)
+    if duplicate_run_ids:
+        warnings.append(
+            f"Duplicate run ids for {relpath(directory)}/{experiment}: {duplicate_run_ids}"
+        )
 
-        # Create header with Overall + pattern types
-        header = f"{'File':<30} {'Overall':<10}"
-        for pt in pattern_types:
-            header += f" {pt:<10}"
-        print(header)
-        print("-" * (40 + len(pattern_types) * 11))
+    observed_run_ids = sorted(
+        run_result["run_id"]
+        for run_result in run_results
+        if run_result["run_id"] is not None
+    )
 
-        # Print rows with Overall + pattern type F1 scores
-        for result in results:
-            overall_f1 = result.get("overall_f1")
-            row = f"{result['file']:<30}"
-            if overall_f1 is not None:
-                row += f" {overall_f1:<10.4f}"
-            else:
-                row += f" {'NA':<10}"
+    missing_run_ids: List[int] = []
 
-            for pt in pattern_types:
-                pt_data = result["by_pattern_type"].get(pt, {})
-                f1_val = pt_data.get("f1")
-                if f1_val is not None:
-                    row += f" {f1_val:<10.4f}"
-                else:
-                    row += f" {'NA':<10}"
-            print(row)
+    if expected_runs is not None and expected_runs > 0:
+        expected = set(range(1, expected_runs + 1))
+        observed = set(observed_run_ids)
+        missing_run_ids = sorted(expected - observed)
 
+        if missing_run_ids:
+            warnings.append(
+                f"Missing run ids for {relpath(directory)}/{experiment}: {missing_run_ids}"
+            )
+
+    file_metrics = [run_result["metrics"] for run_result in run_results]
+    aggregated = aggregate_records(file_metrics)
+
+    result = {
+        "directory": relpath(directory),
+        "experiment": experiment,
+        "label": f"{relpath(directory)}/{experiment}",
+        "n_runs": len(run_results),
+        "run_ids": observed_run_ids,
+        "missing_run_ids": missing_run_ids,
+        "runs": run_results,
+        "by_pattern_type": aggregate_pattern_types(file_metrics),
+        **aggregated,
+    }
+
+    return result, warnings
+
+
+def build_summary(args: argparse.Namespace) -> Dict[str, Any]:
+    files = discover_jsonl_files(
+        input_paths=args.paths,
+        pattern=args.pattern,
+        recursive=args.recursive,
+    )
+
+    groups, warnings = group_files_by_experiment(
+        files,
+        include_unmatched=args.include_unmatched,
+    )
+
+    experiments: List[Dict[str, Any]] = []
+
+    for (directory, experiment), run_items in sorted(
+        groups.items(),
+        key=lambda kv: (str(kv[0][0]), kv[0][1]),
+    ):
+        result, group_warnings = aggregate_experiment_group(
+            directory=directory,
+            experiment=experiment,
+            run_items=run_items,
+            T0=args.T0,
+            T1=args.T1,
+            expected_runs=args.expected_runs,
+        )
+
+        warnings.extend(group_warnings)
+
+        if result is not None:
+            experiments.append(result)
+
+    return {
+        "domain": [args.T0, args.T1],
+        "inputs": args.paths,
+        "pattern": args.pattern,
+        "recursive": args.recursive,
+        "expected_runs": args.expected_runs,
+        "n_files_discovered": len(files),
+        "n_experiments": len(experiments),
+        "experiments": experiments,
+        "warnings": warnings,
+    }
+
+
+def experiment_to_csv_row(exp: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "directory": exp["directory"],
+        "experiment": exp["experiment"],
+        "label": exp["label"],
+        "n_runs": exp["n_runs"],
+        "run_ids": ",".join(str(x) for x in exp["run_ids"]),
+        "missing_run_ids": ",".join(str(x) for x in exp["missing_run_ids"]),
+        "total_rows_mean": exp.get("total_rows_mean"),
+        "total_with_gt_mean": exp.get("total_with_gt_mean"),
+        "valid_predictions_mean": exp.get("valid_predictions_mean"),
+        "invalid_predictions_mean": exp.get("invalid_predictions_mean"),
+        "invalid_detection_rate_percent_mean": exp.get("invalid_detection_rate_percent_mean"),
+        "invalid_detection_rate_percent_std": exp.get("invalid_detection_rate_percent_std"),
+        "precision_mean": exp.get("precision_mean"),
+        "precision_std": exp.get("precision_std"),
+        "recall_mean": exp.get("recall_mean"),
+        "recall_std": exp.get("recall_std"),
+        "f1_mean": exp.get("f1_mean"),
+        "f1_std": exp.get("f1_std"),
+        "avg_d_pred_to_gt_mean": exp.get("avg_d_pred_to_gt_mean"),
+        "avg_d_pred_to_gt_std": exp.get("avg_d_pred_to_gt_std"),
+        "avg_d_gt_to_pred_mean": exp.get("avg_d_gt_to_pred_mean"),
+        "avg_d_gt_to_pred_std": exp.get("avg_d_gt_to_pred_std"),
+    }
+
+
+def write_csv(summary: Dict[str, Any], out_path: Optional[Path] = None) -> None:
+    rows = [experiment_to_csv_row(exp) for exp in summary["experiments"]]
+
+    fieldnames = [
+        "directory",
+        "experiment",
+        "label",
+        "n_runs",
+        "run_ids",
+        "missing_run_ids",
+        "total_rows_mean",
+        "total_with_gt_mean",
+        "valid_predictions_mean",
+        "invalid_predictions_mean",
+        "invalid_detection_rate_percent_mean",
+        "invalid_detection_rate_percent_std",
+        "precision_mean",
+        "precision_std",
+        "recall_mean",
+        "recall_std",
+        "f1_mean",
+        "f1_std",
+        "avg_d_pred_to_gt_mean",
+        "avg_d_pred_to_gt_std",
+        "avg_d_gt_to_pred_mean",
+        "avg_d_gt_to_pred_std",
+    ]
+
+    if out_path is None:
+        writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+        return
+
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def print_table(summary: Dict[str, Any]) -> None:
+    experiments = summary["experiments"]
+
+    print()
+    print("=" * 140)
+    print("AFFILIATION METRICS SUMMARY")
+    print("=" * 140)
+    print(f"Domain: [{summary['domain'][0]}, {summary['domain'][1]})")
+    print(f"Files discovered: {summary['n_files_discovered']}")
+    print(f"Experiments:      {summary['n_experiments']}")
+    print(f"Expected runs:    {summary['expected_runs']}")
+    print("=" * 140)
+
+    if not experiments:
+        print("No experiments found.")
+        return
+
+    header = (
+        f"{'Experiment':<68} "
+        f"{'Runs':>4} "
+        f"{'Missing':>8} "
+        f"{'GT/run':>8} "
+        f"{'Valid/run':>10} "
+        f"{'Invalid%':>9} "
+        f"{'Prec':>8} "
+        f"{'Recall':>8} "
+        f"{'F1':>8} "
+        f"{'F1 std':>8} "
+        f"{'dP→GT':>8} "
+        f"{'dGT→P':>8}"
+    )
+
+    print(header)
+    print("-" * len(header))
+
+    for exp in experiments:
+        missing = (
+            "-"
+            if not exp["missing_run_ids"]
+            else ",".join(str(x) for x in exp["missing_run_ids"])
+        )
+
+        row = (
+            f"{exp['label']:<68} "
+            f"{exp['n_runs']:>4} "
+            f"{missing:>8} "
+            f"{fmt_count(exp.get('total_with_gt_mean')):>8} "
+            f"{fmt_count(exp.get('valid_predictions_mean')):>10} "
+            f"{fmt_float(exp.get('invalid_detection_rate_percent_mean'), 2):>9} "
+            f"{fmt_float(exp.get('precision_mean')):>8} "
+            f"{fmt_float(exp.get('recall_mean')):>8} "
+            f"{fmt_float(exp.get('f1_mean')):>8} "
+            f"{fmt_float(exp.get('f1_std')):>8} "
+            f"{fmt_float(exp.get('avg_d_pred_to_gt_mean'), 2):>8} "
+            f"{fmt_float(exp.get('avg_d_gt_to_pred_mean'), 2):>8}"
+        )
+
+        print(row)
+
+    if summary["warnings"]:
+        print()
+        print("Warnings:")
+        for warning in summary["warnings"]:
+            print(f"- {warning}")
+
+
+def save_output(summary: Dict[str, Any], out_path: Path) -> None:
+    suffix = out_path.suffix.lower()
+
+    if suffix == ".json":
+        out_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        print(f"\nSaved JSON report to {out_path}")
+        return
+
+    write_csv(summary, out_path=out_path)
+    print(f"\nSaved CSV report to {out_path}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Aggregate strict affiliation metrics across JSONL experiment runs."
+    )
+
+    ap.add_argument(
+        "paths",
+        nargs="+",
+        type=str,
+        help="One or several directories/files to aggregate.",
+    )
+
+    ap.add_argument(
+        "--T0",
+        type=int,
+        default=0,
+        help="Domain start, inclusive. Default: 0.",
+    )
+
+    ap.add_argument(
+        "--T1",
+        type=int,
+        default=300,
+        help="Domain end, exclusive. Default: 300.",
+    )
+
+    ap.add_argument(
+        "--expected-runs",
+        type=int,
+        default=3,
+        help="Expected number of runs per experiment. Default: 3.",
+    )
+
+    ap.add_argument(
+        "--pattern",
+        type=str,
+        default="*.jsonl",
+        help="Glob pattern used inside directories. Default: *.jsonl.",
+    )
+
+    ap.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Search JSONL files recursively inside input directories.",
+    )
+
+    ap.add_argument(
+        "--include-unmatched",
+        action="store_true",
+        help="Include JSONL files without final '-N' run suffix as single-run experiments.",
+    )
+
+    ap.add_argument(
+        "--format",
+        choices=["table", "csv", "json"],
+        default="table",
+        help="Stdout format. Default: table.",
+    )
+
+    ap.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help="Optional output path. Use .json for full nested report, otherwise CSV.",
+    )
+
+    args = ap.parse_args()
+
+    summary = build_summary(args)
+
+    if args.format == "json":
+        print(json.dumps(summary, indent=2))
+    elif args.format == "csv":
+        write_csv(summary, out_path=None)
     else:
-        # Normal mode: show overall metrics
-        print(
-            f"{'File':<30} {'Series':<8} {'Eval':<6} {'Precision':<10} {'Recall':<8} {'F1':<8}")
-        print("-" * 70)
+        print_table(summary)
 
-        for result in results:
-            file_name = result["file"]
-            precision = f"{result['precision']:.4f}" if result['precision'] is not None else "NA"
-            recall = f"{result['recall']:.4f}" if result['recall'] is not None else "NA"
-            f1 = f"{result['f1']:.4f}" if result['f1'] is not None else "NA"
-
-            print(f"{file_name:<30} {result.get('evaluable_series', 0):<6} "
-                  f"{precision:<10} {recall:<8} {f1:<8}")
-
-    # Save results if requested
     if args.out:
-        if args.format == "json" or args.out.endswith('.json'):
-            with open(args.out, 'w') as f:
-                json.dump({
-                    "domain": [args.T0, args.T1],
-                    "synth_mode": args.synth,
-                    "files_processed": len(results),
-                    "results": results
-                }, f, indent=2)
-            print(f"\nSaved JSON report to {args.out}")
-        else:
-            if args.synth:
-                # For synth mode, create a flattened CSV with pattern types as columns
-                csv_data = []
-                for result in results:
-                    row = {
-                        "file": result["file"],
-                        "overall_f1": result.get("overall_f1")
-                    }
-                    for pt, pt_data in result["by_pattern_type"].items():
-                        row[f"f1_{pt}"] = pt_data["f1"]
-                    csv_data.append(row)
-                df = pd.DataFrame(csv_data)
-            else:
-                df = pd.DataFrame([
-                    {
-                        "file": r["file"],
-                        # "total_series": r["total_series"],
-                        "evaluable_series": r.get("evaluable_series", 0),
-                        "precision": r["precision"],
-                        "recall": r["recall"],
-                        "f1": r["f1"]
-                    }
-                    for r in results
-                ])
-            df.to_csv(args.out, index=False)
-            print(f"\nSaved CSV report to {args.out}")
+        save_output(summary, Path(args.out))
 
 
 if __name__ == "__main__":
