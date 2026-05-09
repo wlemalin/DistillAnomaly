@@ -5,11 +5,11 @@
 #SBATCH --error=qwen_%j.err
 #SBATCH --gres=gpu:2
 #SBATCH --partition=publicgpu
-#SBATCH --constraint=gpuh100
+#SBATCH --constraint=gpuh200
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=110G
-#SBATCH --time=05:00:00
+#SBATCH --mem=150G
+#SBATCH --time=04:00:00
 
 module purge
 module load python/python-3.11.4
@@ -17,8 +17,7 @@ module load python/python-3.11.4
 echo "Running on $(hostname), Python: $(python --version)"
 PROJ_DIR=$(pwd)
 
-# Define the model paths here
-MODEL_PATH="$HOME/hf_models/Qwen2.5-VL-3B-Instruct"
+MODEL_PATH="$HOME/hf_models/Qwen2.5-VL-3B-Instruct_clean"
 
 run_one(){
 local data=$1
@@ -36,22 +35,27 @@ python3 train_txt_vision_clip.py \
     --grad_accum 4 \
     --lr 2e-5 \
     --debug \
-    --alpha_itc 0.1 \
+    --alpha_itc 0 \
     --bf16
+    #--lr 2e-5 \
+    #--alpha_itc 0.1 \
 }
 
-run_one "src/annotations/jsonl/annotations_ts1_filtered.jsonl" \
-        "train_VL/qwen2.5-vl-3b-lora-vl-ts1-10ep" \
+run_one "../src/annotations/jsonl/V0/annotations_V0.jsonl" \
+        "train_VL/sft-adapters/qwen2.5-3b-lora-V0" \
         10
 
-run_one "src/annotations/jsonl/annotations_ts2_filtered.jsonl" \
-        "train_VL/qwen2.5-vl-3b-lora-vl-ts2-15ep" \
+run_one "../src/annotations/jsonl/V1-expl/annotations_V1.jsonl" \
+        "train_VL/sft-adapters/qwen2.5-3b-lora-V1" \
+        10
+
+run_one "../src/annotations/jsonl/V2-aux/annotations_V2.jsonl" \
+        "train_VL/sft-adapters/qwen2.5-3b-lora-V2" \
         15
 
-run_one "src/annotations/jsonl/annotations_ts3_filtered.jsonl" \
-        "train_VL/qwen2.5-vl-3b-lora-vl-ts3-20ep" \
+run_one "../src/annotations/jsonl/V3-pic/annotations_V3.jsonl" \
+        "train_VL/sft-adapters/qwen2.5-3b-lora-V3" \
         20
 
 echo "All jobs finished."
-
 
